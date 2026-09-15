@@ -1,24 +1,32 @@
 """
-SAM2 + SAM3 inference service - FastAPI
+Labely inference gateway - FastAPI (port 8000)
 
-  * text prompt  ("dogs")            -> SAM3  (needs HF_TOKEN; gated facebook/sam3 repo)
-  * points / box prompt              -> SAM2.1 (public checkpoint baked into the image)
-Both share the same output post-processing: bbox | segment (RLE) | polygon.
-SAM3 is loaded lazily on the first text request so the service stays up without a token.
+  model = sam2          -> SAM 2.1 (public checkpoint baked into the image). Prompts: points / box, or prompt_free
+  model = sam3          -> SAM3 text / concept prompts (needs HF_TOKEN; gated facebook/sam3 repo)
+  model = micro-sam-lm  -> Segment Anything for Microscopy, light microscopy model  } proxied to the
+  model = micro-sam-em  -> Segment Anything for Microscopy, electron microscopy model} micro-sam container (:8001)
+
+All models share the same request/response schema and post-processing: bbox | segment (RLE) | polygon.
+SAM3 is loaded lazily (or at startup when HF_TOKEN is set) so the service stays up without a token.
 """
 import os
 import io
-import base64
+import json
 import logging
 from contextlib import asynccontextmanager
-from typing import List, Optional, Union
+from typing import Optional
 
-import json
 import numpy as np
+import requests
 from PIL import Image
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form
-from pydantic import BaseModel, Field
 import uvicorn
+
+from segmentation_common import (
+    InferenceRequest, InferenceResponse, Point, OUTPUT_TYPES,
+    resolve_model, validate_request, normalize_boxes, points_to_arrays,
+    load_image, image_to_data_uri, build_response,
+)
 
 logger = logging.getLogger("uvicorn.info")
 
@@ -30,23 +38,28 @@ _CFG = {
     "large": "configs/sam2.1/sam2.1_hiera_l.yaml",
 }
 CHECKPOINT = os.getenv("SAM2_CHECKPOINT", f"/app/checkpoints/sam2.1_hiera_{SAM2_SIZE}.pt")
+MICROSAM_URL = os.getenv("MICROSAM_URL", "http://micro-sam-inference:8001")
 
 _predictor = None
 _sam3 = None  # (model, processor)
 _sam3_error = None
 
 
+def _device():
+    import torch
+    device = os.getenv("DEVICE", "cuda:0")
+    if device != "cpu" and not torch.cuda.is_available():
+        logger.warning("CUDA not available, falling back to CPU")
+        device = "cpu"
+    return device
+
+
 def get_predictor():
     global _predictor
     if _predictor is None:
-        import torch
         from sam2.build_sam import build_sam2
         from sam2.sam2_image_predictor import SAM2ImagePredictor
-
-        device = os.getenv("DEVICE", "cuda:0")
-        if device != "cpu" and not torch.cuda.is_available():
-            logger.warning("CUDA not available, falling back to CPU")
-            device = "cpu"
+        device = _device()
         logger.info(f"Loading SAM2 ({SAM2_SIZE}) from {CHECKPOINT} on {device}")
         model = build_sam2(_CFG[SAM2_SIZE], CHECKPOINT, device=device)
         _predictor = SAM2ImagePredictor(model)
@@ -61,12 +74,9 @@ def get_sam3():
     if _sam3_error is not None:
         raise HTTPException(status_code=503, detail=f"SAM3 unavailable: {_sam3_error}")
     try:
-        import torch
         from sam3.model_builder import build_sam3_image_model
         from sam3.model.sam3_image_processor import Sam3Processor
-        device = os.getenv("DEVICE", "cuda:0")
-        if device != "cpu" and not torch.cuda.is_available():
-            device = "cpu"
+        device = _device()
         logger.info(f"Loading SAM3 on {device} (HF_TOKEN set: {bool(os.getenv('HF_TOKEN'))})")
         model = build_sam3_image_model()
         if device != "cpu":
@@ -93,43 +103,19 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="SAM2/SAM3 Inference Service", version="3.0.0", lifespan=lifespan)
-
-
-# ---------- request / response models ----------
-class Point(BaseModel):
-    x: float  # pixel x
-    y: float  # pixel y
-    label: int = 1  # 1 = foreground (include), 0 = background (exclude)
-
-
-class InferenceRequest(BaseModel):
-    image: str  # data:image/...;base64,<...>  or  http(s) URL  or  server-side path
-    prompt: Optional[str] = None  # text prompt, e.g. "dogs" -> SAM3 (needs HF_TOKEN)
-    points: Optional[List[Point]] = None
-    box: Optional[Union[List[float], List[List[float]]]] = Field(
-        default=None, description="[x1, y1, x2, y2] or [[x1, y1, x2, y2], ...] in pixels. "
-                                  "Several boxes -> one mask per box, returned in the same order")
-    output_type: Optional[str] = "segment"  # "bbox", "segment" (RLE mask) or "polygon" (contour vertices)
-    multimask: bool = False
-    polygon_tolerance: float = 2.0  # px; max deviation when simplifying contours (polygon mode). 0 = every boundary pixel
-    min_polygon_area: float = 0.0   # px^2; drop contours (islands) smaller than this (polygon mode)  # True -> return SAM2's 3 candidate masks instead of the best one
-
-
-class MaskResult(BaseModel):
-    mask: Optional[List[int]] = None  # RLE (segment mode only)
-    polygons: Optional[List[List[List[int]]]] = None  # polygon mode: [[[x,y],[x,y],...], ...] one list per outer contour, largest first
-    box_index: Optional[int] = None  # when several boxes were sent: which input box this mask belongs to
-    score: float
-    bbox: List[int]  # [x1, y1, x2, y2]
-
-
-class InferenceResponse(BaseModel):
-    masks: List[MaskResult]
-    image_size: List[int]  # [width, height]
+app = FastAPI(title="Labely Inference Service (SAM2 / SAM3 / micro-sam)", version="4.0.0", lifespan=lifespan)
 
 
 # ---------- endpoints ----------
+def _microsam_health() -> dict:
+    try:
+        r = requests.get(f"{MICROSAM_URL}/health", timeout=3)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        return {"status": "unreachable", "error": f"{type(e).__name__}: {e}"}
+
+
 @app.get("/health")
 async def health():
     sam3_status = ("loaded" if _sam3 is not None else
@@ -137,59 +123,74 @@ async def health():
                    ("not loaded yet" if os.getenv("HF_TOKEN") else "disabled (no HF_TOKEN)"))
     return {
         "status": "healthy",
-        "model": f"SAM2.1-{SAM2_SIZE}" + (" + SAM3" if _sam3 is not None else ""),
-        "sam3": sam3_status,
-        "prompt_types": ["prompt (text, SAM3)", "points", "box"],
-        "supported_output_types": ["bbox", "segment", "polygon"],
+        "models": {
+            "sam2": f"loaded (SAM2.1-{SAM2_SIZE})" if _predictor is not None else "not loaded",
+            "sam3": sam3_status,
+            "micro-sam": _microsam_health(),
+        },
+        "default_model": "sam2 (sam3 when a text prompt is sent)",
+        "prompt_types": {
+            "sam2": ["points", "box", "prompt_free"],
+            "sam3": ["prompt (text)"],
+            "micro-sam-lm": ["points", "box", "prompt_free"],
+            "micro-sam-em": ["points", "box", "prompt_free"],
+        },
+        "supported_output_types": list(OUTPUT_TYPES),
     }
 
 
-def run_inference(image: Image.Image, prompt: Optional[str], points: Optional[List[Point]], box: Optional[List[float]],
-                  output_type: str, multimask: bool,
-                  polygon_tolerance: float = 2.0, min_polygon_area: float = 0.0) -> InferenceResponse:
-    if prompt and (points or box):
-        raise HTTPException(status_code=400, detail="Use either a text 'prompt' (SAM3) or 'points'/'box' (SAM2), not both.")
-    if not prompt and not points and not box:
-        raise HTTPException(status_code=400, detail="Provide a text 'prompt' (SAM3) or 'points' and/or 'box' (SAM2).")
-    boxes = normalize_boxes(box)  # None or (B,4) numpy
-    if boxes is not None and len(boxes) > 1 and points:
-        raise HTTPException(status_code=400, detail="'points' cannot be combined with several boxes; send one box or only boxes")
-    output_type = (output_type or "segment").lower()
-    if output_type not in ("bbox", "segment", "polygon"):
-        raise HTTPException(status_code=400, detail=f"Invalid output_type: {output_type}. Must be 'bbox', 'segment' or 'polygon'")
+def run_inference(req: InferenceRequest, image: Optional[Image.Image] = None) -> InferenceResponse:
+    model = resolve_model(req)
+    output_type = validate_request(req, model)
 
-    width, height = image.size
+    if model.startswith("micro-sam"):
+        return proxy_microsam(req, image)
+
+    if image is None:
+        image = load_image(req.image)
+    W, H = image.size
+
+    if model == "sam3":
+        masks, scores = run_sam3_text(image, req.prompt)
+        return build_response(model, masks, scores, (W, H), output_type,
+                              req.polygon_tolerance, req.min_polygon_area,
+                              min_area=req.min_area, max_objects=req.max_objects)
+
+    # sam2
+    if req.prompt_free:
+        masks, scores = run_sam2_automatic(image, req.points_per_side, req.min_area)
+        return build_response(model, masks, scores, (W, H), output_type,
+                              req.polygon_tolerance, req.min_polygon_area,
+                              min_area=req.min_area, max_objects=req.max_objects)
+
+    boxes = normalize_boxes(req.box)
     multi_box = boxes is not None and len(boxes) > 1
-    if prompt:
-        masks, scores = run_sam3_text(image, prompt)
-    else:
-        masks, scores = run_sam2_geometric(image, points, boxes, multimask)
-
-    # one prompt -> best first; several boxes -> keep input order so results map back to boxes
-    order = range(len(masks)) if multi_box else np.argsort(-scores)
-    results = []
-    for i in order:
-        mask = masks[i] > 0.5
-        rle = mask_to_rle(mask.astype(np.uint8) * 255) if output_type == "segment" else None
-        polys = mask_to_polygons(mask, polygon_tolerance, min_polygon_area) if output_type == "polygon" else None
-        results.append(MaskResult(mask=rle, polygons=polys, score=float(scores[i]), bbox=get_bbox(mask),
-                                  box_index=int(i) if multi_box else None))
-    return InferenceResponse(masks=results, image_size=[width, height])
+    if multi_box and req.points:
+        raise HTTPException(status_code=400, detail="'points' cannot be combined with several boxes; send one box or only boxes")
+    masks, scores = run_sam2_geometric(image, req.points, boxes, req.multimask)
+    return build_response(model, masks, scores, (W, H), output_type,
+                          req.polygon_tolerance, req.min_polygon_area,
+                          keep_order=multi_box, box_indices=list(range(len(masks))) if multi_box else None)
 
 
-def normalize_boxes(box) -> Optional[np.ndarray]:
-    """Accept [x1,y1,x2,y2] or [[...],[...]] -> (B,4) float32 array, or None."""
-    if box is None or (isinstance(box, list) and len(box) == 0):
-        return None
+def proxy_microsam(req: InferenceRequest, image: Optional[Image.Image]) -> InferenceResponse:
+    """Forward the request unchanged to the micro-sam container and return its response."""
+    payload = req.model_dump(by_alias=False)
+    if image is not None:  # multipart upload path: image already decoded here
+        payload["image"] = image_to_data_uri(image)
+    elif not (payload["image"].startswith("data:image") or payload["image"].startswith("http")):
+        payload["image"] = image_to_data_uri(load_image(payload["image"]))  # server-side path -> inline
     try:
-        arr = np.asarray(box, dtype=np.float32)
-    except (ValueError, TypeError):
-        raise HTTPException(status_code=400, detail="'box' must be [x1, y1, x2, y2] or a list of such boxes")
-    if arr.ndim == 1:
-        arr = arr[None, :]
-    if arr.ndim != 2 or arr.shape[1] != 4:
-        raise HTTPException(status_code=400, detail="'box' must be [x1, y1, x2, y2] or a list of such boxes")
-    return arr
+        r = requests.post(f"{MICROSAM_URL}/predict", json=payload, timeout=600)
+    except requests.RequestException as e:
+        raise HTTPException(status_code=503, detail=f"micro-sam service unreachable at {MICROSAM_URL}: {e}")
+    if r.status_code != 200:
+        try:
+            detail = r.json().get("detail", r.text)
+        except ValueError:
+            detail = r.text
+        raise HTTPException(status_code=r.status_code, detail=f"micro-sam: {detail}")
+    return InferenceResponse(**r.json())
 
 
 def run_sam3_text(image: Image.Image, prompt: str):
@@ -222,13 +223,11 @@ def run_sam3_text(image: Image.Image, prompt: str):
     return masks, scores
 
 
-def run_sam2_geometric(image: Image.Image, points: Optional[List[Point]], boxes: Optional[np.ndarray], multimask: bool):
-    point_coords = point_labels = box_arr = None
+def run_sam2_geometric(image: Image.Image, points, boxes: Optional[np.ndarray], multimask: bool):
+    point_coords, point_labels = points_to_arrays(points)
+    box_arr = None
     if boxes is not None:
         box_arr = boxes if len(boxes) > 1 else boxes[0]  # (B,4) batched, or (4,) single
-    if points:
-        point_coords = np.array([[p.x, p.y] for p in points], dtype=np.float32)
-        point_labels = np.array([p.label for p in points], dtype=np.int32)
 
     import torch
     predictor = get_predictor()
@@ -250,24 +249,59 @@ def run_sam2_geometric(image: Image.Image, points: Optional[List[Point]], boxes:
     return masks, scores
 
 
+def run_sam2_automatic(image: Image.Image, points_per_side: int, min_area: float):
+    """Prompt-free: SAM2 automatic mask generation over a point grid. Returns (list of bool masks, scores)."""
+    import torch
+    from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
+    from sam2.utils.amg import rle_to_mask
+    predictor = get_predictor()
+    gen = SAM2AutomaticMaskGenerator(
+        model=predictor.model,
+        points_per_side=max(4, min(int(points_per_side), 128)),
+        pred_iou_thresh=0.8,
+        stability_score_thresh=0.9,
+        min_mask_region_area=0,  # min_area is applied at full resolution in build_response
+        output_mode="uncompressed_rle",  # keep memory low on large images; decode one at a time below
+    )
+    # SAM resizes its input to 1024 px internally, so running the grid on a huge image only adds cost in
+    # mask upsampling / post-processing. Downscale first and upsample the masks afterwards.
+    W, H = image.size
+    max_side = int(os.getenv("PROMPT_FREE_MAX_SIDE", "2048"))
+    scale = min(1.0, max_side / max(W, H))
+    work = image.resize((round(W * scale), round(H * scale)), Image.BILINEAR) if scale < 1.0 else image
+    with torch.inference_mode():
+        anns = gen.generate(np.array(work))
+    anns.sort(key=lambda a: -a["predicted_iou"])
+    masks = [rle_to_mask(a["segmentation"]) for a in anns]
+    if scale < 1.0:
+        import cv2
+        masks = [cv2.resize(m.astype(np.uint8), (W, H), interpolation=cv2.INTER_NEAREST).astype(bool) for m in masks]
+    scores = np.array([a["predicted_iou"] for a in anns], dtype=np.float32)
+    logger.info(f"SAM2 prompt-free (grid {points_per_side}x{points_per_side}, work size {work.size}) -> {len(masks)} object(s)")
+    return masks, scores
+
+
 @app.post("/predict", response_model=InferenceResponse)
 async def predict(request: InferenceRequest):
-    """JSON body: image as base64 data URI / URL / path, plus a text prompt (SAM3) or points/box (SAM2)."""
-    image = load_image(request.image)
-    return run_inference(image, request.prompt, request.points, request.box, request.output_type, request.multimask,
-                         request.polygon_tolerance, request.min_polygon_area)
+    """JSON body: image + (model) + prompt | points/box | prompt_free. See /health for what each model accepts."""
+    return run_inference(request)
 
 
 @app.post("/predict/upload", response_model=InferenceResponse)
 async def predict_upload(
     image: UploadFile = File(..., description="JPEG/PNG file part"),
-    prompt: Optional[str] = Form(None, description="text prompt (SAM3)"),
+    model: Optional[str] = Form(None, description="sam2 | sam3 | micro-sam-lm | micro-sam-em"),
+    prompt: Optional[str] = Form(None, description="text prompt (sam3)"),
     points: Optional[str] = Form(None, description='JSON: [{"x":100,"y":200,"label":1}, ...]'),
-    box: Optional[str] = Form(None, description='JSON [x1,y1,x2,y2] or "x1,y1,x2,y2"'),
+    box: Optional[str] = Form(None, description='JSON [x1,y1,x2,y2], [[...],[...]] or "x1,y1,x2,y2"'),
+    prompt_free: bool = Form(False),
     output_type: str = Form("segment"),
     multimask: bool = Form(False),
     polygon_tolerance: float = Form(2.0),
     min_polygon_area: float = Form(0.0),
+    min_area: float = Form(0.0),
+    max_objects: Optional[int] = Form(None),
+    points_per_side: int = Form(32),
 ):
     """multipart/form-data variant: send the raw image bytes as a file part, prompts as text fields."""
     try:
@@ -281,7 +315,11 @@ async def predict_upload(
             bx = json.loads(box) if box.strip().startswith("[") else [float(v) for v in box.split(",")]
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Could not parse points/box: {e}")
-    return run_inference(pil, prompt, pts, bx, output_type, multimask, polygon_tolerance, min_polygon_area)
+    req = InferenceRequest(image="(uploaded)", model=model, prompt=prompt, points=pts, box=bx, prompt_free=prompt_free,
+                           output_type=output_type, multimask=multimask, polygon_tolerance=polygon_tolerance,
+                           min_polygon_area=min_polygon_area, min_area=min_area, max_objects=max_objects,
+                           points_per_side=points_per_side)
+    return run_inference(req, image=pil)
 
 
 @app.post("/echo")
@@ -321,60 +359,6 @@ async def echo(request: Request):
     else:
         out["body_preview"] = body[:500].decode("utf-8", errors="replace")
     return out
-
-
-# ---------- helpers ----------
-def load_image(image_str: str) -> Image.Image:
-    if image_str.startswith("data:image"):
-        _, data = image_str.split(",", 1)
-        return Image.open(io.BytesIO(base64.b64decode(data))).convert("RGB")
-    if image_str.startswith("http"):
-        import requests
-        r = requests.get(image_str, timeout=30)
-        r.raise_for_status()
-        return Image.open(io.BytesIO(r.content)).convert("RGB")
-    return Image.open(image_str).convert("RGB")
-
-
-def mask_to_rle(mask: np.ndarray) -> List[int]:
-    """Label Studio style RLE: alternating [start, length, start, length, ...] on the flattened mask (1-based)."""
-    pixels = mask.flatten()
-    pixels = np.concatenate([[0], pixels, [0]])
-    runs = np.where(pixels[1:] != pixels[:-1])[0] + 1
-    runs[1::2] -= runs[::2]
-    return runs.tolist()
-
-
-def mask_to_polygons(mask: np.ndarray, tolerance: float = 2.0, min_area: float = 0.0) -> List[List[List[int]]]:
-    """Trace the outer boundary of each connected blob in the mask and simplify it to a polygon.
-
-    Returns a list of contours, largest area first; each contour is [[x, y], ...] in pixel coordinates
-    (closed implicitly: last vertex connects back to the first). Holes inside a blob are ignored.
-    """
-    import cv2
-    contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    polys = []
-    for c in contours:
-        area = cv2.contourArea(c)
-        if area < min_area:
-            continue
-        if tolerance > 0:
-            c = cv2.approxPolyDP(c, tolerance, closed=True)
-        if len(c) < 3:
-            continue
-        polys.append((area, c.reshape(-1, 2).astype(int).tolist()))
-    polys.sort(key=lambda t: -t[0])
-    return [pts for _, pts in polys]
-
-
-def get_bbox(mask: np.ndarray) -> List[int]:
-    rows = np.any(mask, axis=1)
-    cols = np.any(mask, axis=0)
-    if not rows.any() or not cols.any():
-        return [0, 0, 0, 0]
-    rmin, rmax = np.where(rows)[0][[0, -1]]
-    cmin, cmax = np.where(cols)[0][[0, -1]]
-    return [int(cmin), int(rmin), int(cmax), int(rmax)]
 
 
 if __name__ == "__main__":

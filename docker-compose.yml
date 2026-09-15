@@ -51,8 +51,35 @@ services:
       - DEBUG=false
       - HF_TOKEN=${HF_TOKEN}
       - SAM3_TEXT_PROMPT=${SAM3_TEXT_PROMPT:-segment all objects}
+      - MICROSAM_URL=http://micro-sam-inference:8001
     volumes:
       - ${HF_HOST_CACHE:-~/.cache/huggingface}:/root/.cache/huggingface
+    networks:
+      - labely-network
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+
+  # micro-sam (Segment Anything for Microscopy) - conda-based, reached via the gateway on :8000 (model=micro-sam-*)
+  micro-sam-inference:
+    build:
+      context: .
+      dockerfile: services/microsam_inference/Dockerfile
+    container_name: labely-micro-sam-inference
+    ports:
+      - "8001:8001"
+    environment:
+      - DEVICE=${DEVICE:-cuda:0}
+      - MICROSAM_SIZE=${MICROSAM_SIZE:-b}
+      - MICROSAM_PRELOAD=${MICROSAM_PRELOAD:-micro-sam-lm,micro-sam-em}
+      - MICROSAM_CACHEDIR=/models
+    volumes:
+      - microsam-models:/models
     networks:
       - labely-network
     deploy:
@@ -87,6 +114,7 @@ services:
 volumes:
   label-studio-data:
   postgres-data:
+  microsam-models:
 
 networks:
   labely-network:

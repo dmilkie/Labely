@@ -39,6 +39,7 @@ WORKDIR /app
 COPY services/sam3_inference/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+COPY services/common/segmentation_common.py .
 COPY services/sam3_inference/ .
 
 ENV PYTHONUNBUFFERED=1

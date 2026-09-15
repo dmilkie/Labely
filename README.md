@@ -127,75 +127,97 @@ For **segmentation masks**:
 
 ### Inference API (port 8000)
 
-The inference container runs two models behind one endpoint:
+One endpoint, four models, selected with the `model` field:
 
-| prompt | model | needs |
-|---|---|---|
-| `prompt` (text, e.g. `"dogs"`) | **SAM3** | `HF_TOKEN` in `.env` with access to the gated `facebook/sam3` repo |
-| `points` / `box` | **SAM 2.1** | nothing (public checkpoint baked into the image) |
+| `model` | backend | prompts | needs |
+|---|---|---|---|
+| `sam2` (**default**) | SAM 2.1 (Meta) | `points`, `box`, `prompt_free` | nothing (public checkpoint baked into the image) |
+| `sam3` | SAM3 (Meta) | `prompt` (text, e.g. `"dogs"`) | `HF_TOKEN` in `.env` with access to the gated `facebook/sam3` repo |
+| `micro-sam-lm` | Segment Anything for Microscopy, light-microscopy model | `points`, `box`, `prompt_free` | nothing (weights from Zenodo on first start) |
+| `micro-sam-em` | Segment Anything for Microscopy, electron-microscopy model | `points`, `box`, `prompt_free` | nothing |
 
-Without a token the service still starts; text prompts return HTTP 503 with the reason.
+If `model` is omitted it is `sam2`, except that a request carrying a text `prompt` defaults to `sam3`.
+`prompt_free: true` (also accepted as `"prompt-free"`) segments **every object** with no prompt: SAM2 uses
+automatic mask generation over a point grid, micro-sam uses its dedicated instance-segmentation decoder.
+
+The micro-sam models run in their own conda-based container (`micro-sam-inference`, port 8001) because
+they need conda-only dependencies; the gateway on 8000 forwards `model: micro-sam-*` requests to it, so
+clients only ever talk to port 8000. Without a token SAM3 requests return HTTP 503 with the reason; without
+the micro-sam container those requests return 503 too, everything else keeps working.
+
 To enable SAM3: request access at https://huggingface.co/facebook/sam3, create a read token,
 put `HF_TOKEN=hf_...` in `.env` (see `.env.example`), then `docker compose up -d --force-recreate sam3-inference`.
-Weights download into the mounted HF cache on first use.
 
 #### POST `/predict`
 
-**Request:**
+**Request** (all fields except `image` optional):
 ```json
 {
   "image": "data:image/jpeg;base64,...",
+  "model": "sam2",
   "prompt": "dogs",
   "points": [{"x": 640, "y": 420, "label": 1}],
   "box": [100, 50, 900, 700],
+  "prompt_free": false,
   "output_type": "segment",
-  "multimask": false
+  "polygon_tolerance": 2.0,
+  "min_area": 0,
+  "max_objects": null
 }
 ```
 
 **Parameters:**
 - `image` (string, required): Base64 data URI, http(s) URL, or server-side path
-- `prompt` (string, optional): text / concept prompt, routed to SAM3; returns one mask per detected instance
-- `points` (list, optional): pixel coordinates; `label` 1 = include, 0 = exclude (SAM2)
-- `box` (list, optional): `[x1, y1, x2, y2]` in pixels, or a list of boxes `[[...], [...]]` (SAM2). Several boxes give one mask per box, returned in input order with `box_index`; points cannot be combined with several boxes
-- Send either `prompt` or `points`/`box`, not both
-- `output_type` (string, optional): `"bbox"`, `"segment"` (RLE mask) or `"polygon"` (contour vertices) (default: `"segment"`)
-- `multimask` (bool, optional): return SAM2's 3 candidate masks instead of the best one
-- `polygon_tolerance` (float, optional, polygon mode): max simplification error in px (default 2.0; 0 = keep every boundary pixel)
-- `min_polygon_area` (float, optional, polygon mode): drop islands smaller than this many px² (default 0)
+- `model` (string): `sam2` | `sam3` | `micro-sam-lm` | `micro-sam-em` (see table)
+- `prompt` (string): text / concept prompt, `sam3` only; returns one mask per detected instance
+- `points` (list): pixel coordinates; `label` 1 = include, 0 = exclude
+- `box` (list): `[x1, y1, x2, y2]` in pixels, or a list of boxes `[[...], [...]]`. Several boxes give one mask per box, returned in input order with `box_index`; points cannot be combined with several boxes
+- `prompt_free` (bool): segment everything, no prompt (`sam2`, `micro-sam-*`)
+- `output_type` (string): `"bbox"`, `"segment"` (RLE mask) or `"polygon"` (contour vertices) (default `"segment"`)
+- `polygon_tolerance` (float, polygon mode): max simplification error in px (default 2.0; 0 = keep every boundary pixel)
+- `min_polygon_area` (float, polygon mode): drop contour islands smaller than this many px²
+- `min_area` (float): drop instances smaller than this many px² (useful with `prompt_free`)
+- `max_objects` (int): keep only the N best-scoring instances
+- `points_per_side` (int, `sam2` + `prompt_free`): density of the point grid (default 32; more finds smaller objects, slower)
+- `multimask` (bool): return SAM's 3 candidate masks for a single prompt instead of the best one
 
 **Response:**
 ```json
 {
+  "model": "sam2",
   "masks": [
     {
-      "mask": [0, 100, 255, ...],  // RLE [start, length, ...] (segment mode only)
-      "polygons": [[[x, y], [x, y], ...], ...],  // polygon mode only; outer contours, largest first
-      "score": 0.97,
-      "bbox": [50, 50, 150, 150]   // [x1, y1, x2, y2]
+      "mask": [0, 100, 255, ...],        // RLE [start, length, ...] 1-based on the row-major flattened image (segment mode only)
+      "polygons": [[[x, y], [x, y], ...]], // polygon mode only; outer contours, largest first
+      "box_index": null,                 // input box this mask belongs to when several boxes were sent
+      "score": 0.97,                     // model confidence (predicted IoU); 1.0 for micro-sam prompt-free instances
+      "bbox": [50, 50, 150, 150],        // [x1, y1, x2, y2]
+      "area": 12345                      // mask area in px
     }
   ],
   "image_size": [640, 480]
 }
 ```
 
-Model size is chosen at build time: `docker compose build --build-arg SAM2_SIZE=base_plus sam3-inference`
-(`tiny` | `small` | `base_plus` | `large`, default `large`).
+Results are sorted best score first, except multi-box requests which keep input order.
 
-Example client: `python sam3_predict.py image.jpg text:dogs --polygon --save overlay.png` or `python sam3_predict.py image.jpg 640,420 --segment`
+Model size is chosen at build time: `docker compose build --build-arg SAM2_SIZE=base_plus sam3-inference`
+(`tiny` | `small` | `base_plus` | `large`, default `large`); micro-sam size via `MICROSAM_SIZE` in `.env` (`t` | `b` | `l` | `h`).
+
+Example client ([sam3_predict.py](sam3_predict.py)):
+```bash
+python sam3_predict.py image.jpg text:dogs --polygon --save overlay.png      # sam3 text prompt
+python sam3_predict.py image.jpg 640,420 --segment                           # sam2 point
+python sam3_predict.py image.jpg box:100,50,900,700 box:900,50,1500,700      # sam2, two boxes
+python sam3_predict.py image.jpg --auto --min-area 500                       # sam2 prompt-free
+python sam3_predict.py cells.png --model micro-sam-lm --auto --polygon       # micro-sam prompt-free
+```
 
 #### GET `/health`
 
-```json
-{
-  "status": "healthy",
-  "model": "SAM2.1-large",
-  "prompt_types": ["points", "box"],
-  "supported_output_types": ["bbox", "segment", "polygon"]
-}
-```
+Reports which models are loaded, including the micro-sam container's own status.
 
-`POST /predict/upload` accepts the same prompts as `multipart/form-data` (file part `image`, text fields `points`, `box`, `output_type`, ...).
+`POST /predict/upload` accepts the same fields as `multipart/form-data` (file part `image`, text fields for the rest).
 `POST /echo` reflects back the headers and parsed body of any request, useful when debugging a client.
 
 ### Label Studio Adapter API
