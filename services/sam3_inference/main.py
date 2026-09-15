@@ -11,7 +11,7 @@ import io
 import base64
 import logging
 from contextlib import asynccontextmanager
-from typing import List, Optional
+from typing import List, Optional, Union
 
 import json
 import numpy as np
@@ -107,7 +107,9 @@ class InferenceRequest(BaseModel):
     image: str  # data:image/...;base64,<...>  or  http(s) URL  or  server-side path
     prompt: Optional[str] = None  # text prompt, e.g. "dogs" -> SAM3 (needs HF_TOKEN)
     points: Optional[List[Point]] = None
-    box: Optional[List[float]] = Field(default=None, description="[x1, y1, x2, y2] in pixels")
+    box: Optional[Union[List[float], List[List[float]]]] = Field(
+        default=None, description="[x1, y1, x2, y2] or [[x1, y1, x2, y2], ...] in pixels. "
+                                  "Several boxes -> one mask per box, returned in the same order")
     output_type: Optional[str] = "segment"  # "bbox", "segment" (RLE mask) or "polygon" (contour vertices)
     multimask: bool = False
     polygon_tolerance: float = 2.0  # px; max deviation when simplifying contours (polygon mode). 0 = every boundary pixel
@@ -117,6 +119,7 @@ class InferenceRequest(BaseModel):
 class MaskResult(BaseModel):
     mask: Optional[List[int]] = None  # RLE (segment mode only)
     polygons: Optional[List[List[List[int]]]] = None  # polygon mode: [[[x,y],[x,y],...], ...] one list per outer contour, largest first
+    box_index: Optional[int] = None  # when several boxes were sent: which input box this mask belongs to
     score: float
     bbox: List[int]  # [x1, y1, x2, y2]
 
@@ -148,25 +151,45 @@ def run_inference(image: Image.Image, prompt: Optional[str], points: Optional[Li
         raise HTTPException(status_code=400, detail="Use either a text 'prompt' (SAM3) or 'points'/'box' (SAM2), not both.")
     if not prompt and not points and not box:
         raise HTTPException(status_code=400, detail="Provide a text 'prompt' (SAM3) or 'points' and/or 'box' (SAM2).")
-    if box is not None and len(box) != 4:
-        raise HTTPException(status_code=400, detail="'box' must be [x1, y1, x2, y2]")
+    boxes = normalize_boxes(box)  # None or (B,4) numpy
+    if boxes is not None and len(boxes) > 1 and points:
+        raise HTTPException(status_code=400, detail="'points' cannot be combined with several boxes; send one box or only boxes")
     output_type = (output_type or "segment").lower()
     if output_type not in ("bbox", "segment", "polygon"):
         raise HTTPException(status_code=400, detail=f"Invalid output_type: {output_type}. Must be 'bbox', 'segment' or 'polygon'")
 
     width, height = image.size
+    multi_box = boxes is not None and len(boxes) > 1
     if prompt:
         masks, scores = run_sam3_text(image, prompt)
     else:
-        masks, scores = run_sam2_geometric(image, points, box, multimask)
+        masks, scores = run_sam2_geometric(image, points, boxes, multimask)
 
+    # one prompt -> best first; several boxes -> keep input order so results map back to boxes
+    order = range(len(masks)) if multi_box else np.argsort(-scores)
     results = []
-    for i in np.argsort(-scores):  # best first
+    for i in order:
         mask = masks[i] > 0.5
         rle = mask_to_rle(mask.astype(np.uint8) * 255) if output_type == "segment" else None
         polys = mask_to_polygons(mask, polygon_tolerance, min_polygon_area) if output_type == "polygon" else None
-        results.append(MaskResult(mask=rle, polygons=polys, score=float(scores[i]), bbox=get_bbox(mask)))
+        results.append(MaskResult(mask=rle, polygons=polys, score=float(scores[i]), bbox=get_bbox(mask),
+                                  box_index=int(i) if multi_box else None))
     return InferenceResponse(masks=results, image_size=[width, height])
+
+
+def normalize_boxes(box) -> Optional[np.ndarray]:
+    """Accept [x1,y1,x2,y2] or [[...],[...]] -> (B,4) float32 array, or None."""
+    if box is None or (isinstance(box, list) and len(box) == 0):
+        return None
+    try:
+        arr = np.asarray(box, dtype=np.float32)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="'box' must be [x1, y1, x2, y2] or a list of such boxes")
+    if arr.ndim == 1:
+        arr = arr[None, :]
+    if arr.ndim != 2 or arr.shape[1] != 4:
+        raise HTTPException(status_code=400, detail="'box' must be [x1, y1, x2, y2] or a list of such boxes")
+    return arr
 
 
 def run_sam3_text(image: Image.Image, prompt: str):
@@ -199,13 +222,13 @@ def run_sam3_text(image: Image.Image, prompt: str):
     return masks, scores
 
 
-def run_sam2_geometric(image: Image.Image, points: Optional[List[Point]], box: Optional[List[float]], multimask: bool):
+def run_sam2_geometric(image: Image.Image, points: Optional[List[Point]], boxes: Optional[np.ndarray], multimask: bool):
     point_coords = point_labels = box_arr = None
+    if boxes is not None:
+        box_arr = boxes if len(boxes) > 1 else boxes[0]  # (B,4) batched, or (4,) single
     if points:
         point_coords = np.array([[p.x, p.y] for p in points], dtype=np.float32)
         point_labels = np.array([p.label for p in points], dtype=np.int32)
-    if box:
-        box_arr = np.array(box, dtype=np.float32)
 
     import torch
     predictor = get_predictor()
@@ -215,9 +238,16 @@ def run_sam2_geometric(image: Image.Image, points: Optional[List[Point]], box: O
             point_coords=point_coords, point_labels=point_labels,
             box=box_arr, multimask_output=multimask,
         )
-    logger.info(f"SAM2 points={0 if point_coords is None else len(point_coords)} box={box_arr is not None} "
-                f"-> {len(masks)} mask(s), scores={[round(float(s), 3) for s in scores]}")
-    return np.asarray(masks), np.asarray(scores, dtype=np.float32)
+    masks = np.asarray(masks)
+    scores = np.asarray(scores, dtype=np.float32)
+    if masks.ndim == 4:  # batched boxes: (B, K, H, W) / (B, K) -> pick best of K per box
+        best = scores.argmax(axis=1)
+        masks = masks[np.arange(len(masks)), best]
+        scores = scores[np.arange(len(scores)), best]
+    logger.info(f"SAM2 points={0 if point_coords is None else len(point_coords)} "
+                f"boxes={0 if boxes is None else len(boxes)} -> {len(masks)} mask(s), "
+                f"scores={[round(float(s), 3) for s in scores]}")
+    return masks, scores
 
 
 @app.post("/predict", response_model=InferenceResponse)

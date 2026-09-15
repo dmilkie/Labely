@@ -22,6 +22,7 @@ Usage:
     python sam3_predict.py IMAGE 640,420            # one foreground point
     python sam3_predict.py IMAGE 640,420 300,400    # several points
     python sam3_predict.py IMAGE box:100,50,900,700 # a box
+    python sam3_predict.py IMAGE box:... box:...     # several boxes -> one mask per box, in order
     python sam3_predict.py IMAGE text:dogs          # a text prompt (SAM3, needs HF_TOKEN on the server)
     add  --segment  to also get the RLE mask, and  --save out.png  to write a mask overlay
     add  --polygon  to get simplified contour vertices [[x,y],...] instead of a mask (lasso / ROI)
@@ -55,7 +56,13 @@ for a in args[1:]:
     if a.startswith("text:"):
         text = a[5:]
     elif a.startswith("box:"):
-        box = [float(v) for v in a[4:].split(",")]
+        b = [float(v) for v in a[4:].split(",")]
+        if box is None:
+            box = b
+        elif isinstance(box[0], list):
+            box.append(b)
+        else:
+            box = [box, b]
     else:
         x, y = a.split(",")
         points.append({"x": float(x), "y": float(y), "label": 1})
@@ -82,6 +89,8 @@ print(f"prompt: text={text!r} points={points} box={box}")
 for i, m in enumerate(result["masks"]):
     x1, y1, x2, y2 = m["bbox"]
     line = f"  #{i}: score={m['score']:.3f}  bbox=[x1={x1}, y1={y1}, x2={x2}, y2={y2}]"
+    if m.get("box_index") is not None:
+        line += f"  (input box {m['box_index']})"
     if m.get("mask") is not None:
         line += f"  rle_len={len(m['mask'])}"
     if m.get("polygons"):

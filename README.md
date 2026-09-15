@@ -157,7 +157,7 @@ Weights download into the mounted HF cache on first use.
 - `image` (string, required): Base64 data URI, http(s) URL, or server-side path
 - `prompt` (string, optional): text / concept prompt, routed to SAM3; returns one mask per detected instance
 - `points` (list, optional): pixel coordinates; `label` 1 = include, 0 = exclude (SAM2)
-- `box` (list, optional): `[x1, y1, x2, y2]` in pixels (SAM2)
+- `box` (list, optional): `[x1, y1, x2, y2]` in pixels, or a list of boxes `[[...], [...]]` (SAM2). Several boxes give one mask per box, returned in input order with `box_index`; points cannot be combined with several boxes
 - Send either `prompt` or `points`/`box`, not both
 - `output_type` (string, optional): `"bbox"`, `"segment"` (RLE mask) or `"polygon"` (contour vertices) (default: `"segment"`)
 - `multimask` (bool, optional): return SAM2's 3 candidate masks instead of the best one
