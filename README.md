@@ -210,7 +210,7 @@ python sam3_predict.py image.jpg text:dogs --polygon --save overlay.png      # s
 python sam3_predict.py image.jpg 640,420 --segment                           # sam2 point
 python sam3_predict.py image.jpg box:100,50,900,700 box:900,50,1500,700      # sam2, two boxes
 python sam3_predict.py image.jpg --auto --min-area 500                       # sam2 prompt-free
-python sam3_predict.py cells.png --model micro-sam-lm --auto --polygon       # micro-sam prompt-free
+python sam3_predict.py samples/human_mitosis.png --model micro-sam-lm --auto --polygon   # micro-sam prompt-free
 ```
 
 #### GET `/health`
