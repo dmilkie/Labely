@@ -125,10 +125,19 @@ For **segmentation masks**:
 
 ## 📡 API Documentation
 
-### SAM2 Inference API (port 8000)
+### Inference API (port 8000)
 
-The inference container runs **SAM 2.1** (Meta, public checkpoint, no Hugging Face token needed).
-SAM2 segments from **point and/or box prompts**; it has no text prompting.
+The inference container runs two models behind one endpoint:
+
+| prompt | model | needs |
+|---|---|---|
+| `prompt` (text, e.g. `"dogs"`) | **SAM3** | `HF_TOKEN` in `.env` with access to the gated `facebook/sam3` repo |
+| `points` / `box` | **SAM 2.1** | nothing (public checkpoint baked into the image) |
+
+Without a token the service still starts; text prompts return HTTP 503 with the reason.
+To enable SAM3: request access at https://huggingface.co/facebook/sam3, create a read token,
+put `HF_TOKEN=hf_...` in `.env` (see `.env.example`), then `docker compose up -d --force-recreate sam3-inference`.
+Weights download into the mounted HF cache on first use.
 
 #### POST `/predict`
 
@@ -136,6 +145,7 @@ SAM2 segments from **point and/or box prompts**; it has no text prompting.
 ```json
 {
   "image": "data:image/jpeg;base64,...",
+  "prompt": "dogs",
   "points": [{"x": 640, "y": 420, "label": 1}],
   "box": [100, 50, 900, 700],
   "output_type": "segment",
@@ -145,9 +155,10 @@ SAM2 segments from **point and/or box prompts**; it has no text prompting.
 
 **Parameters:**
 - `image` (string, required): Base64 data URI, http(s) URL, or server-side path
-- `points` (list, optional): pixel coordinates; `label` 1 = include, 0 = exclude
-- `box` (list, optional): `[x1, y1, x2, y2]` in pixels
-- At least one of `points` / `box` is required
+- `prompt` (string, optional): text / concept prompt, routed to SAM3; returns one mask per detected instance
+- `points` (list, optional): pixel coordinates; `label` 1 = include, 0 = exclude (SAM2)
+- `box` (list, optional): `[x1, y1, x2, y2]` in pixels (SAM2)
+- Send either `prompt` or `points`/`box`, not both
 - `output_type` (string, optional): `"bbox"`, `"segment"` (RLE mask) or `"polygon"` (contour vertices) (default: `"segment"`)
 - `multimask` (bool, optional): return SAM2's 3 candidate masks instead of the best one
 - `polygon_tolerance` (float, optional, polygon mode): max simplification error in px (default 2.0; 0 = keep every boundary pixel)
@@ -171,7 +182,7 @@ SAM2 segments from **point and/or box prompts**; it has no text prompting.
 Model size is chosen at build time: `docker compose build --build-arg SAM2_SIZE=base_plus sam3-inference`
 (`tiny` | `small` | `base_plus` | `large`, default `large`).
 
-Example client: `python sam3_predict.py image.jpg 640,420 --segment --save overlay.png`
+Example client: `python sam3_predict.py image.jpg text:dogs --polygon --save overlay.png` or `python sam3_predict.py image.jpg 640,420 --segment`
 
 #### GET `/health`
 

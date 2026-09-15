@@ -1,7 +1,10 @@
 """
-SAM2 inference service - FastAPI
-Segments an image from point and/or box prompts (SAM2 has no text prompting).
-Checkpoint is downloaded from Meta's public CDN at image build time; no HF token needed.
+SAM2 + SAM3 inference service - FastAPI
+
+  * text prompt  ("dogs")            -> SAM3  (needs HF_TOKEN; gated facebook/sam3 repo)
+  * points / box prompt              -> SAM2.1 (public checkpoint baked into the image)
+Both share the same output post-processing: bbox | segment (RLE) | polygon.
+SAM3 is loaded lazily on the first text request so the service stays up without a token.
 """
 import os
 import io
@@ -29,6 +32,8 @@ _CFG = {
 CHECKPOINT = os.getenv("SAM2_CHECKPOINT", f"/app/checkpoints/sam2.1_hiera_{SAM2_SIZE}.pt")
 
 _predictor = None
+_sam3 = None  # (model, processor)
+_sam3_error = None
 
 
 def get_predictor():
@@ -48,13 +53,47 @@ def get_predictor():
     return _predictor
 
 
+def get_sam3():
+    """Load SAM3 on first use. Raises HTTPException 503 with the reason if it cannot load."""
+    global _sam3, _sam3_error
+    if _sam3 is not None:
+        return _sam3
+    if _sam3_error is not None:
+        raise HTTPException(status_code=503, detail=f"SAM3 unavailable: {_sam3_error}")
+    try:
+        import torch
+        from sam3.model_builder import build_sam3_image_model
+        from sam3.model.sam3_image_processor import Sam3Processor
+        device = os.getenv("DEVICE", "cuda:0")
+        if device != "cpu" and not torch.cuda.is_available():
+            device = "cpu"
+        logger.info(f"Loading SAM3 on {device} (HF_TOKEN set: {bool(os.getenv('HF_TOKEN'))})")
+        model = build_sam3_image_model()
+        if device != "cpu":
+            model = model.to(device)
+        model.eval()
+        _sam3 = (model, Sam3Processor(model))
+        logger.info("SAM3 loaded")
+        return _sam3
+    except Exception as e:  # gated repo / no token / download failure
+        _sam3_error = f"{type(e).__name__}: {str(e).splitlines()[0][:300]}"
+        logger.error(f"SAM3 failed to load: {_sam3_error}")
+        raise HTTPException(status_code=503, detail=f"SAM3 unavailable: {_sam3_error}. "
+                            "Text prompts need a Hugging Face token with access to facebook/sam3 (HF_TOKEN in .env).")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    get_predictor()
+    get_predictor()  # SAM2 always
+    if os.getenv("HF_TOKEN"):
+        try:
+            get_sam3()  # warm up SAM3 if a token is present
+        except HTTPException:
+            pass
     yield
 
 
-app = FastAPI(title="SAM2 Inference Service", version="2.0.0", lifespan=lifespan)
+app = FastAPI(title="SAM2/SAM3 Inference Service", version="3.0.0", lifespan=lifespan)
 
 
 # ---------- request / response models ----------
@@ -66,6 +105,7 @@ class Point(BaseModel):
 
 class InferenceRequest(BaseModel):
     image: str  # data:image/...;base64,<...>  or  http(s) URL  or  server-side path
+    prompt: Optional[str] = None  # text prompt, e.g. "dogs" -> SAM3 (needs HF_TOKEN)
     points: Optional[List[Point]] = None
     box: Optional[List[float]] = Field(default=None, description="[x1, y1, x2, y2] in pixels")
     output_type: Optional[str] = "segment"  # "bbox", "segment" (RLE mask) or "polygon" (contour vertices)
@@ -89,19 +129,25 @@ class InferenceResponse(BaseModel):
 # ---------- endpoints ----------
 @app.get("/health")
 async def health():
+    sam3_status = ("loaded" if _sam3 is not None else
+                   ("error: " + _sam3_error) if _sam3_error else
+                   ("not loaded yet" if os.getenv("HF_TOKEN") else "disabled (no HF_TOKEN)"))
     return {
         "status": "healthy",
-        "model": f"SAM2.1-{SAM2_SIZE}",
-        "prompt_types": ["points", "box"],
+        "model": f"SAM2.1-{SAM2_SIZE}" + (" + SAM3" if _sam3 is not None else ""),
+        "sam3": sam3_status,
+        "prompt_types": ["prompt (text, SAM3)", "points", "box"],
         "supported_output_types": ["bbox", "segment", "polygon"],
     }
 
 
-def run_sam2(image: Image.Image, points: Optional[List[Point]], box: Optional[List[float]],
-             output_type: str, multimask: bool,
-             polygon_tolerance: float = 2.0, min_polygon_area: float = 0.0) -> InferenceResponse:
-    if not points and not box:
-        raise HTTPException(status_code=400, detail="Provide 'points' and/or 'box'. SAM2 has no text prompts.")
+def run_inference(image: Image.Image, prompt: Optional[str], points: Optional[List[Point]], box: Optional[List[float]],
+                  output_type: str, multimask: bool,
+                  polygon_tolerance: float = 2.0, min_polygon_area: float = 0.0) -> InferenceResponse:
+    if prompt and (points or box):
+        raise HTTPException(status_code=400, detail="Use either a text 'prompt' (SAM3) or 'points'/'box' (SAM2), not both.")
+    if not prompt and not points and not box:
+        raise HTTPException(status_code=400, detail="Provide a text 'prompt' (SAM3) or 'points' and/or 'box' (SAM2).")
     if box is not None and len(box) != 4:
         raise HTTPException(status_code=400, detail="'box' must be [x1, y1, x2, y2]")
     output_type = (output_type or "segment").lower()
@@ -109,6 +155,51 @@ def run_sam2(image: Image.Image, points: Optional[List[Point]], box: Optional[Li
         raise HTTPException(status_code=400, detail=f"Invalid output_type: {output_type}. Must be 'bbox', 'segment' or 'polygon'")
 
     width, height = image.size
+    if prompt:
+        masks, scores = run_sam3_text(image, prompt)
+    else:
+        masks, scores = run_sam2_geometric(image, points, box, multimask)
+
+    results = []
+    for i in np.argsort(-scores):  # best first
+        mask = masks[i] > 0.5
+        rle = mask_to_rle(mask.astype(np.uint8) * 255) if output_type == "segment" else None
+        polys = mask_to_polygons(mask, polygon_tolerance, min_polygon_area) if output_type == "polygon" else None
+        results.append(MaskResult(mask=rle, polygons=polys, score=float(scores[i]), bbox=get_bbox(mask)))
+    return InferenceResponse(masks=results, image_size=[width, height])
+
+
+def run_sam3_text(image: Image.Image, prompt: str):
+    """SAM3 concept segmentation: returns (masks (N,H,W) numpy, scores (N,) numpy)."""
+    import torch
+    model, processor = get_sam3()
+    use_cuda = next(model.parameters()).is_cuda
+    # SAM3 is meant to run under bf16 autocast (as in Meta's examples); without it fc layers hit a dtype mismatch
+    with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16, enabled=use_cuda):
+        state = processor.set_image(image)
+        out = processor.set_text_prompt(state=state, prompt=prompt)
+    masks = out.get("masks", [])
+    scores = out.get("scores", [])
+    if hasattr(masks, "cpu"):  # bf16 tensors cannot go straight to numpy
+        masks = masks.detach().float().cpu().numpy()
+    if hasattr(scores, "cpu"):
+        scores = scores.detach().float().cpu().numpy()
+    masks = np.asarray(masks)
+    if masks.ndim == 4:  # (N,1,H,W)
+        masks = masks[:, 0]
+    scores = np.asarray(scores, dtype=np.float32).reshape(-1)
+    W, H = image.size
+    if masks.ndim != 3 or len(masks) == 0:
+        logger.info(f"SAM3 found nothing for prompt '{prompt}'")
+        return np.zeros((0, H, W), dtype=bool), np.zeros((0,), dtype=np.float32)
+    if masks.shape[1:] != (H, W):  # SAM3 may return masks at model resolution
+        import cv2
+        masks = np.stack([cv2.resize(m.astype(np.float32), (W, H), interpolation=cv2.INTER_LINEAR) for m in masks])
+    logger.info(f"SAM3 prompt='{prompt}' -> {len(masks)} object(s), scores={[round(float(s), 3) for s in scores]}")
+    return masks, scores
+
+
+def run_sam2_geometric(image: Image.Image, points: Optional[List[Point]], box: Optional[List[float]], multimask: bool):
     point_coords = point_labels = box_arr = None
     if points:
         point_coords = np.array([[p.x, p.y] for p in points], dtype=np.float32)
@@ -124,29 +215,23 @@ def run_sam2(image: Image.Image, points: Optional[List[Point]], box: Optional[Li
             point_coords=point_coords, point_labels=point_labels,
             box=box_arr, multimask_output=multimask,
         )
-    logger.info(f"points={0 if point_coords is None else len(point_coords)} box={box_arr is not None} "
+    logger.info(f"SAM2 points={0 if point_coords is None else len(point_coords)} box={box_arr is not None} "
                 f"-> {len(masks)} mask(s), scores={[round(float(s), 3) for s in scores]}")
-
-    results = []
-    for i in np.argsort(-scores):  # best first
-        mask = masks[i] > 0.5
-        rle = mask_to_rle(mask.astype(np.uint8) * 255) if output_type == "segment" else None
-        polys = mask_to_polygons(mask, polygon_tolerance, min_polygon_area) if output_type == "polygon" else None
-        results.append(MaskResult(mask=rle, polygons=polys, score=float(scores[i]), bbox=get_bbox(mask)))
-    return InferenceResponse(masks=results, image_size=[width, height])
+    return np.asarray(masks), np.asarray(scores, dtype=np.float32)
 
 
 @app.post("/predict", response_model=InferenceResponse)
 async def predict(request: InferenceRequest):
-    """JSON body: image as base64 data URI / URL / path, plus points and/or box."""
+    """JSON body: image as base64 data URI / URL / path, plus a text prompt (SAM3) or points/box (SAM2)."""
     image = load_image(request.image)
-    return run_sam2(image, request.points, request.box, request.output_type, request.multimask,
-                    request.polygon_tolerance, request.min_polygon_area)
+    return run_inference(image, request.prompt, request.points, request.box, request.output_type, request.multimask,
+                         request.polygon_tolerance, request.min_polygon_area)
 
 
 @app.post("/predict/upload", response_model=InferenceResponse)
 async def predict_upload(
     image: UploadFile = File(..., description="JPEG/PNG file part"),
+    prompt: Optional[str] = Form(None, description="text prompt (SAM3)"),
     points: Optional[str] = Form(None, description='JSON: [{"x":100,"y":200,"label":1}, ...]'),
     box: Optional[str] = Form(None, description='JSON [x1,y1,x2,y2] or "x1,y1,x2,y2"'),
     output_type: str = Form("segment"),
@@ -166,7 +251,7 @@ async def predict_upload(
             bx = json.loads(box) if box.strip().startswith("[") else [float(v) for v in box.split(",")]
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Could not parse points/box: {e}")
-    return run_sam2(pil, pts, bx, output_type, multimask, polygon_tolerance, min_polygon_area)
+    return run_inference(pil, prompt, pts, bx, output_type, multimask, polygon_tolerance, min_polygon_area)
 
 
 @app.post("/echo")

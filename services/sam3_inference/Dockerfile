@@ -1,4 +1,5 @@
-# SAM2 inference service Dockerfile (no Hugging Face token required)
+# SAM2 + SAM3 inference service Dockerfile
+# SAM2 works with no token; SAM3 text prompts need HF_TOKEN (see .env.example)
 FROM pytorch/pytorch:2.7.0-cuda12.6-cudnn9-runtime
 
 WORKDIR /tmp
@@ -16,6 +17,14 @@ RUN git clone https://github.com/facebookresearch/sam2.git && \
     cd sam2 && \
     SAM2_BUILD_CUDA=0 pip install --no-cache-dir --no-build-isolation . && \
     cd .. && rm -rf sam2
+
+# Install SAM3 (text/concept prompts). Weights are NOT baked in: they are a gated HF repo and are
+# downloaded at first use into the mounted HF cache using HF_TOKEN from .env.
+RUN pip install --no-cache-dir einops decord pycocotools huggingface-hub && \
+    git clone https://github.com/facebookresearch/sam3.git && \
+    cd sam3 && \
+    pip install --no-cache-dir --no-build-isolation . && \
+    cd .. && rm -rf sam3
 
 # Download the SAM 2.1 checkpoint from Meta's public CDN (no auth).
 # Override SAM2_SIZE at build time: tiny | small | base_plus | large

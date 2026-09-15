@@ -5,11 +5,12 @@ Endpoint:  POST http://localhost:8000/predict
 Body (JSON):
     {
       "image":       "data:image/jpeg;base64,<base64 of the jpeg bytes>",
-      "points":      [{"x": 640, "y": 420, "label": 1}],   # label 1 = include, 0 = exclude
+      "prompt":      "dogs",                                 # text prompt -> SAM3 (needs HF_TOKEN)
+      "points":      [{"x": 640, "y": 420, "label": 1}],   # label 1 = include, 0 = exclude  -> SAM2
       "box":         [x1, y1, x2, y2],                       # optional, pixels
       "output_type": "bbox"                                  # or "segment" (adds RLE mask)
     }
-    At least one of "points" or "box" is required.
+    Send either "prompt" (SAM3) or "points"/"box" (SAM2).
 Response (JSON):
     {
       "masks": [ {"mask": [...] or null, "score": 0.97, "bbox": [x1, y1, x2, y2]} ],
@@ -21,6 +22,7 @@ Usage:
     python sam3_predict.py IMAGE 640,420            # one foreground point
     python sam3_predict.py IMAGE 640,420 300,400    # several points
     python sam3_predict.py IMAGE box:100,50,900,700 # a box
+    python sam3_predict.py IMAGE text:dogs          # a text prompt (SAM3, needs HF_TOKEN on the server)
     add  --segment  to also get the RLE mask, and  --save out.png  to write a mask overlay
     add  --polygon  to get simplified contour vertices [[x,y],...] instead of a mask (lasso / ROI)
 """
@@ -48,14 +50,18 @@ with open(IMAGE_PATH, "rb") as f:
 payload = {"image": f"data:image/jpeg;base64,{b64}", "output_type": OUTPUT_TYPE}
 
 # 2. Add the prompt (points and/or box, pixel coordinates)
-points, box = [], None
+points, box, text = [], None, None
 for a in args[1:]:
-    if a.startswith("box:"):
+    if a.startswith("text:"):
+        text = a[5:]
+    elif a.startswith("box:"):
         box = [float(v) for v in a[4:].split(",")]
     else:
         x, y = a.split(",")
         points.append({"x": float(x), "y": float(y), "label": 1})
-if not points and box is None:
+if text:
+    payload["prompt"] = text
+elif not points and box is None:
     from PIL import Image
     w, h = Image.open(IMAGE_PATH).size
     points = [{"x": w / 2, "y": h / 2, "label": 1}]
@@ -72,7 +78,7 @@ result = resp.json()
 # 4. Use the result
 w, h = result["image_size"]
 print(f"image size: {w}x{h}")
-print(f"prompt: points={points} box={box}")
+print(f"prompt: text={text!r} points={points} box={box}")
 for i, m in enumerate(result["masks"]):
     x1, y1, x2, y2 = m["bbox"]
     line = f"  #{i}: score={m['score']:.3f}  bbox=[x1={x1}, y1={y1}, x2={x2}, y2={y2}]"
@@ -87,8 +93,9 @@ if SAVE_PATH and result["masks"] and result["masks"][0].get("polygons"):
     from PIL import Image, ImageDraw
     img = Image.open(IMAGE_PATH).convert("RGB")
     d = ImageDraw.Draw(img)
-    for poly in result["masks"][0]["polygons"]:
-        d.polygon([tuple(p) for p in poly], outline=(255, 0, 0), width=max(2, w // 600))
+    for m in result["masks"]:
+        for poly in m.get("polygons") or []:
+            d.polygon([tuple(p) for p in poly], outline=(255, 0, 0), width=max(2, w // 600))
     img.save(SAVE_PATH)
     print(f"saved polygon overlay to {SAVE_PATH}")
 
@@ -96,10 +103,11 @@ if SAVE_PATH and result["masks"] and result["masks"][0].get("polygons"):
 if SAVE_PATH and result["masks"] and result["masks"][0].get("mask"):
     import numpy as np
     from PIL import Image
-    rle = result["masks"][0]["mask"]
     flat = np.zeros(w * h, dtype=bool)
-    for start, length in zip(rle[0::2], rle[1::2]):
-        flat[start - 1:start - 1 + length] = True
+    for m in result["masks"]:
+        rle = m.get("mask") or []
+        for start, length in zip(rle[0::2], rle[1::2]):
+            flat[start - 1:start - 1 + length] = True
     mask = flat.reshape(h, w)
     img = np.array(Image.open(IMAGE_PATH).convert("RGB")).astype(np.float32)
     img[mask] = img[mask] * 0.4 + np.array([255, 0, 0]) * 0.6
