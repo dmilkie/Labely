@@ -175,8 +175,7 @@ put `HF_TOKEN=hf_...` in `.env` (see `.env.example`), then `docker compose up -d
 - `prompt_free` (bool): segment everything, no prompt (`sam2`, `micro-sam-*`)
 - `output_type` (string): `"bbox"`, `"segment"` (RLE mask) or `"polygon"` (contour vertices) (default `"segment"`)
 - `polygon_tolerance` (float, polygon mode): max simplification error in px (default 2.0; 0 = keep every boundary pixel)
-- `min_polygon_area` (float, polygon mode): drop contour islands smaller than this many px²
-- `min_area` (float): drop instances smaller than this many px² (useful with `prompt_free`)
+- `min_area` (float): drop objects smaller than this many px²; in polygon mode also drops stray contour islands below it (useful with `prompt_free`)
 - `max_objects` (int): keep only the N best-scoring instances
 - `points_per_side` (int, `sam2` + `prompt_free`): density of the point grid (default 32; more finds smaller objects, slower)
 - `multimask` (bool): return SAM's 3 candidate masks for a single prompt instead of the best one

@@ -117,8 +117,7 @@ async def predict(req: InferenceRequest):
     if req.prompt_free:
         masks, scores = run_ais(predictor, decoder, image, req.min_area)
         return build_response(model, masks, scores, (W, H), output_type,
-                              req.polygon_tolerance, req.min_polygon_area,
-                              min_area=req.min_area, max_objects=req.max_objects)
+                              req.polygon_tolerance, req.min_area, max_objects=req.max_objects)
 
     boxes = normalize_boxes(req.box)
     multi_box = boxes is not None and len(boxes) > 1
@@ -126,7 +125,7 @@ async def predict(req: InferenceRequest):
         raise HTTPException(status_code=400, detail="'points' cannot be combined with several boxes; send one box or only boxes")
     masks, scores = run_prompted(predictor, image, req.points, boxes, req.multimask)
     return build_response(model, masks, scores, (W, H), output_type,
-                          req.polygon_tolerance, req.min_polygon_area,
+                          req.polygon_tolerance, req.min_area,
                           keep_order=multi_box, box_indices=list(range(len(masks))) if multi_box else None)
 
 

@@ -29,7 +29,7 @@ Usage:
     python sam3_predict.py IMAGE text:dogs          # a text prompt (SAM3, needs HF_TOKEN on the server)
     add  --segment  to also get the RLE mask, and  --save out.png  to write a mask overlay
     add  --polygon  to get simplified contour vertices [[x,y],...] instead of a mask (lasso / ROI)
-    add  --min-area N  (prompt-free) to drop objects smaller than N px^2, --max-objects N to keep the N best
+    add  --min-area N  to drop objects (and, in polygon mode, contour islands) smaller than N px^2; --max-objects N keeps the N best
 """
 import base64
 import json
@@ -67,11 +67,12 @@ with open(IMAGE_PATH, "rb") as f:
 payload = {"image": f"data:image/jpeg;base64,{b64}", "output_type": OUTPUT_TYPE}
 if MODEL:
     payload["model"] = MODEL
+if MIN_AREA:
+    payload["min_area"] = MIN_AREA
+if MAX_OBJECTS is not None:
+    payload["max_objects"] = MAX_OBJECTS
 if AUTO:
     payload["prompt_free"] = True
-    payload["min_area"] = MIN_AREA
-    if MAX_OBJECTS is not None:
-        payload["max_objects"] = MAX_OBJECTS
 
 # 2. Add the prompt (points and/or box, pixel coordinates)
 points, box, text = [], None, None

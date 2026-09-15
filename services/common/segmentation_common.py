@@ -44,9 +44,8 @@ class InferenceRequest(BaseModel):
     output_type: Optional[str] = "segment"  # "bbox", "segment" (RLE mask) or "polygon" (contour vertices)
     multimask: bool = False  # SAM2/micro-sam prompted: return the 3 candidate masks instead of the best one
     polygon_tolerance: float = 2.0  # px; max deviation when simplifying contours (polygon mode). 0 = every boundary pixel
-    min_polygon_area: float = 0.0   # px^2; drop contours (islands) smaller than this (polygon mode)
+    min_area: float = 0.0           # px^2; drop objects smaller than this; in polygon mode also drops contour islands below it
     # prompt-free options
-    min_area: float = 0.0           # px^2; drop instances smaller than this
     max_objects: Optional[int] = None  # keep only the N best-scoring instances
     points_per_side: int = 32       # sam2 prompt-free: density of the point grid (more = smaller objects, slower)
 
@@ -182,9 +181,9 @@ def get_bbox(mask: np.ndarray) -> List[int]:
 
 
 def build_response(model: str, masks, scores, image_size, output_type: str,
-                   polygon_tolerance: float = 2.0, min_polygon_area: float = 0.0,
+                   polygon_tolerance: float = 2.0, min_area: float = 0.0,
                    keep_order: bool = False, box_indices: Optional[List[int]] = None,
-                   min_area: float = 0.0, max_objects: Optional[int] = None) -> InferenceResponse:
+                   max_objects: Optional[int] = None) -> InferenceResponse:
     """Turn (N,H,W) masks + (N,) scores into the API response.
 
     masks may be a numpy array or a list of 2-D arrays (bool/float). Sorted best-score first unless keep_order.
@@ -200,7 +199,7 @@ def build_response(model: str, masks, scores, image_size, output_type: str,
         if area == 0 or area < min_area:
             continue
         rle = mask_to_rle(mask.astype(np.uint8) * 255) if output_type == "segment" else None
-        polys = mask_to_polygons(mask, polygon_tolerance, min_polygon_area) if output_type == "polygon" else None
+        polys = mask_to_polygons(mask, polygon_tolerance, min_area) if output_type == "polygon" else None
         results.append(MaskResult(mask=rle, polygons=polys, score=float(scores[i]), bbox=get_bbox(mask), area=area,
                                   box_index=(box_indices[i] if box_indices is not None else None)))
         if max_objects is not None and len(results) >= max_objects:
