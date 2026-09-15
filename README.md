@@ -166,19 +166,22 @@ put `HF_TOKEN=hf_...` in `.env` (see `.env.example`), then `docker compose up -d
 }
 ```
 
-**Parameters:**
-- `image` (string, required): Base64 data URI, http(s) URL, or server-side path
-- `model` (string): `sam2` | `sam3` | `micro-sam-lm` | `micro-sam-em` (see table)
-- `prompt` (string): text / concept prompt, `sam3` only; returns one mask per detected instance
-- `points` (list): pixel coordinates; `label` 1 = include, 0 = exclude
-- `box` (list): `[x1, y1, x2, y2]` in pixels, or a list of boxes `[[...], [...]]`. Several boxes give one mask per box, returned in input order with `box_index`; points cannot be combined with several boxes
-- `prompt_free` (bool): segment everything, no prompt (`sam2`, `micro-sam-*`)
-- `output_type` (string): `"bbox"`, `"segment"` (RLE mask) or `"polygon"` (contour vertices) (default `"segment"`)
-- `polygon_tolerance` (float, polygon mode): max simplification error in px (default 2.0; 0 = keep every boundary pixel)
-- `min_area` (float): drop objects smaller than this many px²; in polygon mode also drops stray contour islands below it (useful with `prompt_free`)
-- `max_objects` (int): keep only the N best-scoring instances
-- `points_per_side` (int, `sam2` + `prompt_free`): density of the point grid (default 32; more finds smaller objects, slower)
-- `multimask` (bool): return SAM's 3 candidate masks for a single prompt instead of the best one
+**Parameters** (only `image` is required):
+
+| field | type | default | applies to | meaning |
+|---|---|---|---|---|
+| `image` | string | required | all | Base64 data URI, http(s) URL, or server-side path |
+| `model` | string | `"sam2"` (`"sam3"` if `prompt` is set) | all | `sam2` \| `sam3` \| `micro-sam-lm` \| `micro-sam-em` |
+| `prompt` | string | `null` | `sam3` | text / concept prompt; returns one mask per detected instance |
+| `points` | list | `null` | `sam2`, `micro-sam-*` | `[{"x": px, "y": px, "label": 1}]`; `label` 1 = include, 0 = exclude (default 1) |
+| `box` | list | `null` | `sam2`, `micro-sam-*` | `[x1, y1, x2, y2]` in pixels, or a list of boxes. Several boxes give one mask per box in input order with `box_index`; not combinable with `points` |
+| `prompt_free` | bool | `false` | `sam2`, `micro-sam-*` | segment every object without a prompt (alias `"prompt-free"`) |
+| `output_type` | string | `"segment"` | all | `"bbox"`, `"segment"` (RLE mask) or `"polygon"` (contour vertices) |
+| `polygon_tolerance` | float | `2.0` | polygon mode | max simplification error in px; `0` keeps every boundary pixel |
+| `min_area` | float | `0` | all | drop objects smaller than this many px²; in polygon mode also drops stray contour islands below it |
+| `max_objects` | int | `null` (no limit) | all | keep only the N best-scoring objects |
+| `points_per_side` | int | `32` | `sam2` + `prompt_free` | density of the point grid; more finds smaller objects, slower (clamped to 4..128) |
+| `multimask` | bool | `false` | prompted `sam2`, `micro-sam-*` | return SAM's 3 candidate masks for a single prompt instead of the best one |
 
 **Response:**
 ```json
