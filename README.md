@@ -125,33 +125,42 @@ For **segmentation masks**:
 
 ## 📡 API Documentation
 
-### SAM3 Inference API
+### SAM2 Inference API (port 8000)
+
+The inference container runs **SAM 2.1** (Meta, public checkpoint, no Hugging Face token needed).
+SAM2 segments from **point and/or box prompts**; it has no text prompting.
 
 #### POST `/predict`
-
-Perform segmentation inference with text prompts.
 
 **Request:**
 ```json
 {
   "image": "data:image/jpeg;base64,...",
-  "prompt": "segment all dogs",
-  "output_type": "segment"
+  "points": [{"x": 640, "y": 420, "label": 1}],
+  "box": [100, 50, 900, 700],
+  "output_type": "segment",
+  "multimask": false
 }
 ```
 
 **Parameters:**
-- `image` (string, required): Base64-encoded image or image URL
-- `prompt` (string, optional): Text prompt for segmentation (default: from `SAM3_TEXT_PROMPT` env var)
-- `output_type` (string, optional): `"bbox"` or `"segment"` (default: `"segment"`)
+- `image` (string, required): Base64 data URI, http(s) URL, or server-side path
+- `points` (list, optional): pixel coordinates; `label` 1 = include, 0 = exclude
+- `box` (list, optional): `[x1, y1, x2, y2]` in pixels
+- At least one of `points` / `box` is required
+- `output_type` (string, optional): `"bbox"`, `"segment"` (RLE mask) or `"polygon"` (contour vertices) (default: `"segment"`)
+- `multimask` (bool, optional): return SAM2's 3 candidate masks instead of the best one
+- `polygon_tolerance` (float, optional, polygon mode): max simplification error in px (default 2.0; 0 = keep every boundary pixel)
+- `min_polygon_area` (float, optional, polygon mode): drop islands smaller than this many px² (default 0)
 
 **Response:**
 ```json
 {
   "masks": [
     {
-      "mask": [0, 100, 255, ...],  // RLE format (null for bbox mode)
-      "score": 0.95,
+      "mask": [0, 100, 255, ...],  // RLE [start, length, ...] (segment mode only)
+      "polygons": [[[x, y], [x, y], ...], ...],  // polygon mode only; outer contours, largest first
+      "score": 0.97,
       "bbox": [50, 50, 150, 150]   // [x1, y1, x2, y2]
     }
   ],
@@ -159,19 +168,24 @@ Perform segmentation inference with text prompts.
 }
 ```
 
+Model size is chosen at build time: `docker compose build --build-arg SAM2_SIZE=base_plus sam3-inference`
+(`tiny` | `small` | `base_plus` | `large`, default `large`).
+
+Example client: `python sam3_predict.py image.jpg 640,420 --segment --save overlay.png`
+
 #### GET `/health`
 
-Health check endpoint.
-
-**Response:**
 ```json
 {
   "status": "healthy",
-  "model": "SAM3",
-  "default_prompt": "segment all objects",
-  "supported_output_types": ["bbox", "segment"]
+  "model": "SAM2.1-large",
+  "prompt_types": ["points", "box"],
+  "supported_output_types": ["bbox", "segment", "polygon"]
 }
 ```
+
+`POST /predict/upload` accepts the same prompts as `multipart/form-data` (file part `image`, text fields `points`, `box`, `output_type`, ...).
+`POST /echo` reflects back the headers and parsed body of any request, useful when debugging a client.
 
 ### Label Studio Adapter API
 

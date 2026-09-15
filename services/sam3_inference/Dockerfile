@@ -1,34 +1,35 @@
-# SAM3 推理服务 Dockerfile
+# SAM2 inference service Dockerfile (no Hugging Face token required)
 FROM pytorch/pytorch:2.7.0-cuda12.6-cudnn9-runtime
 
 WORKDIR /tmp
 
-# 安装系统依赖
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
+    curl \
     libgl1-mesa-glx \
     libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
-# 安装 PyTorch 和基础依赖
-RUN pip install torch==2.7.0 torchvision --index-url https://download.pytorch.org/whl/cu126 --no-cache-dir
-RUN pip install einops decord pycocotools huggingface-hub --no-cache-dir
+# Install SAM2 from source. SAM2_BUILD_CUDA=0 skips the optional CUDA extension
+# (only used for mask post-processing) so no nvcc is needed in the runtime image.
+RUN git clone https://github.com/facebookresearch/sam2.git && \
+    cd sam2 && \
+    SAM2_BUILD_CUDA=0 pip install --no-cache-dir --no-build-isolation . && \
+    cd .. && rm -rf sam2
 
-# 克隆并安装 SAM3（在 /tmp 下，不干扰 /app）
-RUN git clone https://github.com/facebookresearch/sam3.git && \
-    cd sam3 && \
-    pip install --no-cache-dir . && \
-    cd .. && \
-    rm -rf sam3
+# Download the SAM 2.1 checkpoint from Meta's public CDN (no auth).
+# Override SAM2_SIZE at build time: tiny | small | base_plus | large
+ARG SAM2_SIZE=large
+ENV SAM2_SIZE=${SAM2_SIZE}
+RUN mkdir -p /app/checkpoints && \
+    curl -fL -o /app/checkpoints/sam2.1_hiera_${SAM2_SIZE}.pt \
+      https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_${SAM2_SIZE}.pt
 
-# 设置应用工作目录
 WORKDIR /app
 
-# 复制依赖文件并安装应用依赖
 COPY services/sam3_inference/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# 复制应用代码
 COPY services/sam3_inference/ .
 
 ENV PYTHONUNBUFFERED=1

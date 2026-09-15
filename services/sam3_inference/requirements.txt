@@ -1,4 +1,4 @@
-# SAM3 纯推理服务依赖
+# SAM2 inference service dependencies
 # 无 Label Studio 依赖
 
 # Web 框架
@@ -6,13 +6,15 @@ fastapi==0.109.0
 uvicorn[standard]==0.27.0
 pydantic==2.5.0
 
-# SAM3
+# Image + numeric
 numpy>=1.26,<2.0
 pillow>=9.0.0
 opencv-python>=4.8.0
 scikit-image>=0.19.0
 
-# SAM3 模型
+# SAM2 is installed in the Dockerfile from github.com/facebookresearch/sam2
 
 # 工具
 python-dotenv==1.0.0
+requests>=2.31.0
+python-multipart>=0.0.9
