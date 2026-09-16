@@ -8,14 +8,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends libgl1 libglib2
     && rm -rf /var/lib/apt/lists/*
 
 # GPU build of torch per the micro-sam install docs: micro_sam "libtorch=*=cuda*".
-# CONDA_OVERRIDE_CUDA tells the solver a CUDA driver will be present at runtime (no GPU during docker build);
-# cuda-version pins the CUDA runtime the torch build targets. Keep it <= what the host driver supports
-# (driver 535 -> CUDA 12.2, which still runs 12.6 builds via minor-version compatibility; 12.9 builds fail with
-# "CUDA error: named symbol not found"). Override at build time: --build-arg CUDA_VERSION=12.8
-ARG CUDA_VERSION=12.6
+# CONDA_OVERRIDE_CUDA tells the solver a CUDA driver will be present at runtime (there is no GPU during
+# docker build). The solver then picks the newest CUDA torch build; the host driver must support it
+# (driver >= 570 for CUDA 12.8/12.9 builds). On an older driver you get "CUDA error: named symbol not
+# found" at load time: either update the driver or pin, e.g. --build-arg CUDA_PIN='"cuda-version=12.6"'
+ARG CUDA_VERSION=12.9
+ARG CUDA_PIN=""
 RUN CONDA_OVERRIDE_CUDA=${CUDA_VERSION} micromamba install -y -n base -c conda-forge \
         micro_sam \
-        "cuda-version=${CUDA_VERSION}" \
+        ${CUDA_PIN} \
         "libtorch=*=cuda*" \
         fastapi uvicorn python-multipart requests py-opencv pillow \
     && micromamba clean -a -y
