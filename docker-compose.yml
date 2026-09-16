@@ -43,6 +43,7 @@ services:
     build:
       context: .
       dockerfile: services/sam3_inference/Dockerfile
+    image: ghcr.io/dmilkie/labely-gateway:${LABELY_TAG:-latest}
     container_name: labely-sam3-inference
     ports:
       - "8000:8000"
@@ -70,6 +71,7 @@ services:
     build:
       context: .
       dockerfile: services/microsam_inference/Dockerfile
+    image: ghcr.io/dmilkie/labely-micro-sam:${LABELY_TAG:-latest}
     container_name: labely-micro-sam-inference
     ports:
       - "8001:8001"
@@ -77,9 +79,6 @@ services:
       - DEVICE=${DEVICE:-cuda:0}
       - MICROSAM_SIZE=${MICROSAM_SIZE:-b}
       - MICROSAM_PRELOAD=${MICROSAM_PRELOAD:-micro-sam-lm,micro-sam-em}
-      - MICROSAM_CACHEDIR=/models
-    volumes:
-      - microsam-models:/models
     networks:
       - labely-network
     deploy:
@@ -114,7 +113,6 @@ services:
 volumes:
   label-studio-data:
   postgres-data:
-  microsam-models:
 
 networks:
   labely-network:

@@ -19,7 +19,7 @@ from typing import Optional
 import numpy as np
 import requests
 from PIL import Image
-from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, Request, Response, UploadFile, File, Form
 import uvicorn
 
 from segmentation_common import (
@@ -137,6 +137,32 @@ async def health():
         },
         "supported_output_types": list(OUTPUT_TYPES),
     }
+
+
+@app.get("/ready")
+async def ready(response: Response):
+    """200 only when every configured model can serve; 503 otherwise. Meant for start-up polling by clients.
+
+    sam2 must be loaded; sam3 must be loaded if HF_TOKEN is set; the micro-sam container must report
+    ready unless MICROSAM_URL is empty (micro-sam disabled).
+    """
+    problems = []
+    if _predictor is None:
+        problems.append("sam2 not loaded")
+    if os.getenv("HF_TOKEN") and _sam3 is None:
+        problems.append("sam3 not loaded" + (f" ({_sam3_error})" if _sam3_error else ""))
+    if MICROSAM_URL:
+        try:
+            r = requests.get(f"{MICROSAM_URL}/ready", timeout=3)
+            if r.status_code != 200:
+                problems.append(f"micro-sam not ready: {r.text[:200]}")
+        except Exception as e:
+            problems.append(f"micro-sam unreachable: {type(e).__name__}")
+    if problems:
+        response.status_code = 503
+        return {"ready": False, "problems": problems}
+    return {"ready": True, "models": ["sam2"] + (["sam3"] if _sam3 is not None else [])
+            + (["micro-sam-lm", "micro-sam-em"] if MICROSAM_URL else [])}
 
 
 def run_inference(req: InferenceRequest, image: Optional[Image.Image] = None) -> InferenceResponse:

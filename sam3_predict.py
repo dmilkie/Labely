@@ -37,7 +37,7 @@ import sys
 
 import requests
 
-URL = "http://localhost:8000/predict"
+URL = "http://127.0.0.1:8000/predict"  # not "localhost": on Windows that may resolve to ::1 first
 
 argv = sys.argv[1:]
 

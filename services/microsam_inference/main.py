@@ -5,7 +5,7 @@ Segment Anything for Microscopy (https://github.com/computational-cell-analytics
   model = micro-sam-lm -> vit_<size>_lm            (light microscopy: cells, nuclei, ...)
   model = micro-sam-em -> vit_<size>_em_organelles (electron microscopy: mitochondria, nuclei, ...)
 Prompts: points / box (SAM predictor) or prompt_free (automatic instance segmentation decoder, AIS).
-Weights download from Zenodo on first use into MICROSAM_CACHEDIR; no token needed.
+Weights are baked into the image at $MICROSAM_CACHEDIR (see Dockerfile / scripts/fetch_microsam_weights.py).
 
 Normally reached through the gateway on :8000 (model=micro-sam-*), but speaks the same API directly.
 """
@@ -16,7 +16,7 @@ from typing import Optional
 
 import numpy as np
 from PIL import Image
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 import uvicorn
 
 from segmentation_common import (
@@ -94,6 +94,16 @@ async def health():
         "prompt_types": ["points", "box", "prompt_free"],
         "supported_output_types": list(OUTPUT_TYPES),
     }
+
+
+@app.get("/ready")
+async def ready(response: Response):
+    """200 when every model listed in MICROSAM_PRELOAD is loaded, 503 otherwise."""
+    missing = [n for n in PRELOAD if n in MODEL_TYPES and n not in _models]
+    if missing:
+        response.status_code = 503
+        return {"ready": False, "problems": [f"{n} " + ("error: " + _errors[n] if n in _errors else "not loaded") for n in missing]}
+    return {"ready": True, "models": [n for n in PRELOAD if n in MODEL_TYPES]}
 
 
 def _to_model_input(image: Image.Image) -> np.ndarray:

@@ -64,14 +64,15 @@ Labely/
 ### First start (builds images, downloads weights)
 
 ```bash
-cp .env.example .env          # then put HF_TOKEN=hf_... in .env if you want SAM3 text prompts
+cp .env.example .env                        # then put HF_TOKEN=hf_... in .env if you want SAM3 text prompts
+python scripts/fetch_microsam_weights.py    # stages the micro-sam weights (~830 MB) for the image build
 docker compose up -d --build sam3-inference micro-sam-inference
 ```
 
 The first build takes a while: the SAM2/SAM3 image downloads the SAM 2.1 checkpoint (~900 MB) and the
-micro-sam image solves a conda environment (~10 min). On first container start, SAM3 (if `HF_TOKEN` is set)
-and micro-sam download their weights into Docker volumes (`~/.cache/huggingface` mount and `microsam-models`),
-so later starts do not download again.
+micro-sam image solves a conda environment (~10 min) and bakes in the staged micro-sam weights. On first
+container start, SAM3 (if `HF_TOKEN` is set) downloads its weights into the Hugging Face cache volume;
+nothing else is downloaded at runtime.
 
 ### Cold start (images already built)
 
@@ -90,10 +91,14 @@ need the command above after an explicit `docker compose down` / `stop`.
 ### Verify
 
 ```bash
+curl -f http://localhost:8000/ready   # HTTP 200 only when every model is loaded (503 + reasons otherwise)
 curl http://localhost:8000/health     # gateway: reports sam2, sam3 and the micro-sam container state
 curl http://localhost:8001/health     # micro-sam directly
 curl http://localhost:9090/health     # Label Studio ML adapter (if started)
 ```
+
+`/ready` is what a client should poll at start-up: connection refused means the models are still loading,
+503 lists what is missing, 200 means go.
 
 Then try the sample client:
 
@@ -119,11 +124,54 @@ image only re-solves conda when its Dockerfile changes.
   assertion in the NVIDIA prestart hook, and running ones throw CUDA errors. Restart Docker Desktop
   (`wsl --shutdown` first), then `docker compose restart sam3-inference micro-sam-inference ls-adapter label-studio`
   to re-create the host port forwards, which can otherwise stay dead for auto-restarted containers.
+- **Requests to `localhost` hang** (Windows + Docker Desktop): `localhost` may resolve to `::1`, where Docker
+  Desktop keeps a listener it never forwards. Use `http://127.0.0.1:8000` in clients (the sample client does).
 - **Port 8080 clash**: LabVIEW's `ApplicationWebServer` also listens on 8080 on machines with LabVIEW installed,
   which hides the Label Studio UI. Change the `label-studio` port mapping in `docker-compose.yml` if you need both.
 - **Old driver + micro-sam**: conda-forge picks the newest CUDA torch build (12.9). On drivers older than 570 it
   fails with "CUDA error: named symbol not found"; rebuild with
   `docker compose build --build-arg CUDA_PIN='"cuda-version=12.6"' --build-arg CUDA_VERSION=12.6 micro-sam-inference`.
+
+## 📦 Deployment (pre-built images)
+
+For machines that only run the API (e.g. a LabVIEW acquisition PC) use [`compose.deploy.yml`](compose.deploy.yml):
+it pulls the two inference images from GHCR, has no build step and no Label Studio. Ports 8000/8001 are
+published on all interfaces (binding to 127.0.0.1 only breaks `localhost` clients on Windows, see the comment
+in the file); restrict with the host firewall if needed. Clients should address `http://127.0.0.1:8000`.
+
+### Publish images (from a dev machine)
+
+```bash
+python scripts/fetch_microsam_weights.py
+LABELY_TAG=v1.0.0 docker compose build sam3-inference micro-sam-inference   # tags ghcr.io/dmilkie/labely-{gateway,micro-sam}:v1.0.0
+docker login ghcr.io                                                        # once; PAT with write:packages
+LABELY_TAG=v1.0.0 docker compose push sam3-inference micro-sam-inference
+```
+
+Set `LABELY_TAG` in `.env` instead of the environment if you prefer. Repeat with `LABELY_TAG=latest` to move
+the floating tag. Make the two packages public in GitHub so target machines need no `docker login`.
+Image sizes: gateway ~8 GB, micro-sam ~15 GB (CUDA + torch + baked weights).
+
+### Target machine
+
+One-time: Docker Desktop (WSL2 backend, start on login), NVIDIA driver >= 570, a deploy folder with
+`compose.deploy.yml` and a `.env` containing `LABELY_TAG=v1.0.0` and optionally `HF_TOKEN=hf_...`.
+
+Then, from that folder (this is the sequence a client such as LabVIEW can run via System Exec):
+
+```bash
+docker info                                   # 1. engine up? retry / start Docker Desktop if not
+docker compose -f compose.deploy.yml pull     # 2. fetch the pinned tag (non-fatal offline: local images are used)
+docker compose -f compose.deploy.yml up -d    # 3. idempotent; recreates only containers whose image changed
+curl -f http://127.0.0.1:8000/ready           # 4. poll until HTTP 200 (allow ~90 s warm, minutes on a first start with SAM3)
+```
+
+On failure, `docker compose -f compose.deploy.yml logs --tail 50` shows why (missing token, stale WSL2 driver, ...).
+
+### Update / roll back
+
+Change `LABELY_TAG` in `.env`, then run steps 2-4 again. SAM3 weights live in the `hf-cache` volume and the
+micro-sam weights are inside the image, so updates never re-download model files.
 
 ## 🔧 Configuration
 

@@ -63,3 +63,6 @@ tmp/
 temp/
 *.tmp
 right_dog.png
+
+# micro-sam weights staged for the docker build (scripts/fetch_microsam_weights.py)
+services/microsam_inference/weights/

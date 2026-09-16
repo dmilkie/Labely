@@ -1,0 +1,61 @@
+# Labely inference stack for deployment: pre-built images from GHCR, no build step, no Label Studio.
+#
+#   docker compose -f compose.deploy.yml pull
+#   docker compose -f compose.deploy.yml up -d
+#   curl -f http://127.0.0.1:8000/ready        # 200 when every model is loaded
+#
+# Pin a release with LABELY_TAG in .env (default: latest). HF_TOKEN in .env enables SAM3 text prompts.
+# Ports: published on all interfaces ("8000:8000"). Binding to 127.0.0.1 only looks safer but breaks
+# clients that resolve "localhost" to ::1 (Windows does): Docker Desktop keeps a listener on [::1] that it
+# never forwards, so requests hang, and "[::1]:8000:8000" cannot be added because Docker holds that socket.
+# Restrict access with the host firewall instead if the machine is on a shared network.
+# Clients on this machine should use http://127.0.0.1:8000 (works with any binding).
+
+services:
+  sam3-inference:
+    image: ghcr.io/dmilkie/labely-gateway:${LABELY_TAG:-latest}
+    container_name: labely-sam3-inference
+    ports:
+      - "8000:8000"
+    environment:
+      - DEVICE=${DEVICE:-cuda:0}
+      - HF_TOKEN=${HF_TOKEN}
+      - MICROSAM_URL=http://micro-sam-inference:8001
+    volumes:
+      - hf-cache:/root/.cache/huggingface     # SAM3 weights (gated, downloaded once with HF_TOKEN)
+    networks:
+      - labely-network
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+
+  micro-sam-inference:
+    image: ghcr.io/dmilkie/labely-micro-sam:${LABELY_TAG:-latest}
+    container_name: labely-micro-sam-inference
+    ports:
+      - "8001:8001"
+    environment:
+      - DEVICE=${DEVICE:-cuda:0}
+      - MICROSAM_PRELOAD=${MICROSAM_PRELOAD:-micro-sam-lm,micro-sam-em}
+    networks:
+      - labely-network
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+
+volumes:
+  hf-cache:
+
+networks:
+  labely-network:
+    driver: bridge

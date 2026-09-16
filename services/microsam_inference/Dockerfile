@@ -1,6 +1,9 @@
 # micro-sam (Segment Anything for Microscopy) inference service
 # micro_sam depends on conda-only packages (vigra, nifty, elf), so this image is conda-based and
 # separate from the SAM2/SAM3 pip image. The gateway on :8000 proxies model=micro-sam-* here.
+#
+# Before building, stage the weights (they are baked into the image so a cold start never downloads):
+#     python scripts/fetch_microsam_weights.py          # -> services/microsam_inference/weights/
 FROM mambaorg/micromamba:2.0-ubuntu22.04
 
 USER root
@@ -24,8 +27,12 @@ RUN CONDA_OVERRIDE_CUDA=${CUDA_VERSION} micromamba install -y -n base -c conda-f
 ENV PATH=/opt/conda/bin:$PATH
 ENV PYTHONUNBUFFERED=1
 ENV DEVICE=cuda:0
-ENV MICROSAM_CACHEDIR=/models
 ENV MICROSAM_SIZE=b
+
+# Baked weights. micro_sam looks in $MICROSAM_CACHEDIR/models/<name> and verifies the xxh128 hash,
+# so nothing is downloaded at runtime as long as the staged files are intact.
+ENV MICROSAM_CACHEDIR=/opt/microsam
+COPY services/microsam_inference/weights/ /opt/microsam/models/
 
 WORKDIR /app
 COPY services/common/segmentation_common.py .
