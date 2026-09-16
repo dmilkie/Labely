@@ -57,28 +57,73 @@ Labely/
 
 ### Prerequisites
 
-- Docker and Docker Compose
-- NVIDIA GPU with CUDA support (for SAM3 inference)
-- NVIDIA Container Toolkit
+- Docker Desktop (Windows/macOS) or Docker Engine + Compose (Linux)
+- NVIDIA GPU with a recent driver (>= 570 for the unpinned micro-sam image, see its Dockerfile) and the NVIDIA Container Toolkit
+- Optional: a Hugging Face token with access to `facebook/sam3` for text prompts (see [Configuration](#-configuration))
 
-### Start All Services
-
-```bash
-docker compose up -d
-```
-
-### Verify Services
+### First start (builds images, downloads weights)
 
 ```bash
-# SAM3 Inference Service
-curl http://localhost:8000/health
-
-# Label Studio Adapter
-curl http://localhost:9090/health
-
-# Label Studio Web UI
-open http://localhost:8080
+cp .env.example .env          # then put HF_TOKEN=hf_... in .env if you want SAM3 text prompts
+docker compose up -d --build sam3-inference micro-sam-inference
 ```
+
+The first build takes a while: the SAM2/SAM3 image downloads the SAM 2.1 checkpoint (~900 MB) and the
+micro-sam image solves a conda environment (~10 min). On first container start, SAM3 (if `HF_TOKEN` is set)
+and micro-sam download their weights into Docker volumes (`~/.cache/huggingface` mount and `microsam-models`),
+so later starts do not download again.
+
+### Cold start (images already built)
+
+Only the inference containers are needed for an external client such as LabVIEW:
+
+```bash
+docker compose up -d sam3-inference micro-sam-inference
+```
+
+Add Label Studio, its database and the ML adapter too with plain `docker compose up -d`.
+
+Startup times on an RTX 4070: port **8000** answers after ~40 s (SAM2 + SAM3 loading), port **8001** after ~15 s.
+Both containers have `restart: unless-stopped`, so after a reboot Docker starts them automatically; you only
+need the command above after an explicit `docker compose down` / `stop`.
+
+### Verify
+
+```bash
+curl http://localhost:8000/health     # gateway: reports sam2, sam3 and the micro-sam container state
+curl http://localhost:8001/health     # micro-sam directly
+curl http://localhost:9090/health     # Label Studio ML adapter (if started)
+```
+
+Then try the sample client:
+
+```bash
+python sam3_predict.py samples/human_mitosis.png --model micro-sam-lm --auto --polygon
+```
+
+### Stop / restart / rebuild
+
+```bash
+docker compose stop sam3-inference micro-sam-inference        # stop
+docker compose restart sam3-inference micro-sam-inference     # restart
+docker compose up -d --build sam3-inference micro-sam-inference   # rebuild after editing services/
+```
+
+Rebuilding the SAM2/SAM3 image after a Python-only change takes seconds (layers are cached); the micro-sam
+image only re-solves conda when its Dockerfile changes.
+
+### Known gotchas
+
+- **No `HF_TOKEN`**: everything works except text prompts, which return HTTP 503 with the reason.
+- **After an NVIDIA driver update** (Docker Desktop / WSL2): GPU containers fail to start with an `ld.so`
+  assertion in the NVIDIA prestart hook, and running ones throw CUDA errors. Restart Docker Desktop
+  (`wsl --shutdown` first), then `docker compose restart sam3-inference micro-sam-inference ls-adapter label-studio`
+  to re-create the host port forwards, which can otherwise stay dead for auto-restarted containers.
+- **Port 8080 clash**: LabVIEW's `ApplicationWebServer` also listens on 8080 on machines with LabVIEW installed,
+  which hides the Label Studio UI. Change the `label-studio` port mapping in `docker-compose.yml` if you need both.
+- **Old driver + micro-sam**: conda-forge picks the newest CUDA torch build (12.9). On drivers older than 570 it
+  fails with "CUDA error: named symbol not found"; rebuild with
+  `docker compose build --build-arg CUDA_PIN='"cuda-version=12.6"' --build-arg CUDA_VERSION=12.6 micro-sam-inference`.
 
 ## 🔧 Configuration
 
