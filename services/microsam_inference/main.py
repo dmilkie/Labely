@@ -22,7 +22,7 @@ import uvicorn
 from segmentation_common import (
     InferenceRequest, InferenceResponse, OUTPUT_TYPES,
     resolve_model, validate_request, normalize_boxes, points_to_arrays,
-    load_image, build_response, label_image_to_masks,
+    load_image, build_response, label_image_to_masks, log_cuda_compat,
 )
 
 logger = logging.getLogger("uvicorn.info")
@@ -36,6 +36,7 @@ PRELOAD = [m.strip() for m in os.getenv("MICROSAM_PRELOAD", "micro-sam-lm,micro-
 
 _models = {}   # name -> (predictor, decoder)
 _errors = {}   # name -> str
+_cuda = {"ok": True, "warning": None}  # filled at startup by log_cuda_compat()
 
 
 def _device():
@@ -72,12 +73,17 @@ def get_model(name: str):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    for name in PRELOAD:
-        if name in MODEL_TYPES:
-            try:
-                get_model(name)
-            except HTTPException:
-                pass
+    global _cuda
+    _cuda = log_cuda_compat(logger, "micro-sam")
+    if _cuda["ok"]:
+        for name in PRELOAD:
+            if name in MODEL_TYPES:
+                try:
+                    get_model(name)
+                except HTTPException:
+                    pass
+    else:
+        logger.error("GPU unusable, models not loaded. /ready stays 503 until the host driver is fixed.")
     yield
 
 
@@ -87,7 +93,8 @@ app = FastAPI(title="micro-sam Inference Service", version="1.0.0", lifespan=lif
 @app.get("/health")
 async def health():
     return {
-        "status": "healthy",
+        "status": "healthy" if _cuda["ok"] else "degraded",
+        "cuda": _cuda,
         "models": {name: ("loaded" if name in _models else ("error: " + _errors[name]) if name in _errors else "not loaded yet")
                    for name in MODEL_TYPES},
         "model_types": MODEL_TYPES,
@@ -100,9 +107,11 @@ async def health():
 async def ready(response: Response):
     """200 when every model listed in MICROSAM_PRELOAD is loaded, 503 otherwise."""
     missing = [n for n in PRELOAD if n in MODEL_TYPES and n not in _models]
-    if missing:
+    problems = ([_cuda["warning"]] if not _cuda["ok"] else []) + \
+               [f"{n} " + ("error: " + _errors[n] if n in _errors else "not loaded") for n in missing]
+    if problems:
         response.status_code = 503
-        return {"ready": False, "problems": [f"{n} " + ("error: " + _errors[n] if n in _errors else "not loaded") for n in missing]}
+        return {"ready": False, "problems": problems}
     return {"ready": True, "models": [n for n in PRELOAD if n in MODEL_TYPES]}
 
 

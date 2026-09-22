@@ -5,6 +5,7 @@ Used by both containers (SAM2/SAM3 on :8000, micro-sam on :8001) so the JSON API
 Copied into each image as /app/segmentation_common.py.
 """
 import base64
+import os
 import io
 from typing import List, Optional, Union
 
@@ -212,3 +213,104 @@ def label_image_to_masks(label_img: np.ndarray):
     ids = np.unique(label_img)
     ids = ids[ids != 0]
     return [label_img == i for i in ids]
+
+
+# ---------- CUDA / driver compatibility ----------
+# Minimum NVIDIA driver (Linux / Windows) that supports each CUDA runtime minor version, per NVIDIA's
+# CUDA Toolkit release notes. Used only to phrase the advice; the decision comes from the probe below.
+_MIN_DRIVER = {
+    (12, 0): "525", (12, 1): "530", (12, 2): "535", (12, 3): "545", (12, 4): "550",
+    (12, 5): "555", (12, 6): "560", (12, 8): "570", (12, 9): "575", (13, 0): "580",
+}
+DRIVER_DOWNLOAD_URL = "https://www.nvidia.com/drivers"
+
+
+def _parse_ver(v):
+    try:
+        major, minor = str(v).split(".")[:2]
+        return int(major), int(minor)
+    except (ValueError, AttributeError):
+        return None
+
+
+def cuda_compat_report() -> dict:
+    """Compare the CUDA version this image was built for with what the host driver supports, and run a
+    tiny GPU kernel. Returns a dict; `ok` False plus a human-readable `warning` when the GPU cannot be used.
+
+    Typical failure: image built for CUDA 12.9, host driver only supports 12.2 -> kernels fail with
+    "CUDA error: named symbol not found". The fix is always on the HOST: update the NVIDIA display driver.
+    Set LABELY_FAKE_DRIVER_CUDA=12.2 to exercise the warning path on a compatible machine (testing only).
+    """
+    import torch
+    rep = {"build_cuda": torch.version.cuda, "torch": torch.__version__, "driver_cuda": None,
+           "driver_version": None, "gpu": None, "ok": True, "warning": None}
+    if not torch.cuda.is_available():
+        rep["ok"] = False
+        rep["warning"] = ("No CUDA device visible to this container. Check that the NVIDIA driver is installed on the "
+                          "host, Docker has GPU support (`docker run --gpus all ...` works) and the compose file keeps "
+                          "the nvidia device reservation.")
+        return rep
+    try:
+        rep["gpu"] = torch.cuda.get_device_name(0)
+    except Exception:
+        pass
+    # driver-supported CUDA version, straight from libcuda (injected by the NVIDIA container toolkit)
+    try:
+        import ctypes
+        lib = ctypes.CDLL("libcuda.so.1")
+        v = ctypes.c_int()
+        lib.cuInit(0)
+        if lib.cuDriverGetVersion(ctypes.byref(v)) == 0 and v.value:
+            rep["driver_cuda"] = f"{v.value // 1000}.{(v.value % 1000) // 10}"
+    except Exception:
+        pass
+    try:
+        import subprocess
+        out = subprocess.run(["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
+                             capture_output=True, text=True, timeout=10).stdout.strip().splitlines()
+        if out:
+            rep["driver_version"] = out[0].strip()
+    except Exception:
+        pass
+    fake = os.getenv("LABELY_FAKE_DRIVER_CUDA")
+    if fake:
+        rep["driver_cuda"] = fake
+        rep["faked"] = True
+
+    # functional probe: a real kernel launch + matmul catches "named symbol not found" and friends
+    probe_error = None
+    if not fake:
+        try:
+            x = torch.randn(64, 64, device="cuda")
+            (x @ x).sum().item()
+            torch.cuda.synchronize()
+        except Exception as e:
+            probe_error = str(e).splitlines()[0][:200]
+
+    build, drv = _parse_ver(rep["build_cuda"]), _parse_ver(rep["driver_cuda"])
+    version_gap = build is not None and drv is not None and drv < build
+    if probe_error or version_gap:
+        rep["ok"] = False
+        need = _MIN_DRIVER.get(build, "the latest") if build else "the latest"
+        drv_txt = (f"NVIDIA driver {rep['driver_version'] or '?'} (supports CUDA <= {rep['driver_cuda'] or '?'})")
+        rep["warning"] = (
+            f"CUDA MISMATCH: this image was built for CUDA {rep['build_cuda']} but the host's {drv_txt} is too old"
+            + (f"; GPU probe failed: {probe_error}" if probe_error else "")
+            + f". FIX ON THE HOST MACHINE: update the NVIDIA display driver to version {need} or newer "
+            f"({DRIVER_DOWNLOAD_URL}), then restart Docker Desktop and run `docker compose up -d` again. "
+            f"(Alternative: rebuild this image with a CUDA pin matching the driver, see services/*/Dockerfile.)"
+        )
+    return rep
+
+
+def log_cuda_compat(logger, service: str) -> dict:
+    """Run cuda_compat_report() and log it prominently. Returns the report."""
+    import os as _os
+    rep = cuda_compat_report()
+    if rep["ok"]:
+        logger.info(f"[{service}] GPU {rep['gpu']}: driver {rep['driver_version']} (CUDA <= {rep['driver_cuda']}), "
+                    f"image built for CUDA {rep['build_cuda']} - compatible")
+    else:
+        bar = "!" * 100
+        logger.error(f"\n{bar}\n[{service}] {rep['warning']}\n{bar}")
+    return rep

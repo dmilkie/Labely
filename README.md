@@ -98,7 +98,8 @@ curl http://localhost:9090/health     # Label Studio ML adapter (if started)
 ```
 
 `/ready` is what a client should poll at start-up: connection refused means the models are still loading,
-503 lists what is missing, 200 means go.
+503 lists what is missing (including a CUDA/driver mismatch warning with the fix), 200 means go.
+`/health` additionally carries a `cuda` block (image CUDA version, host driver, GPU, ok flag).
 
 Then try the sample client:
 
@@ -128,8 +129,13 @@ image only re-solves conda when its Dockerfile changes.
   Desktop keeps a listener it never forwards. Use `http://127.0.0.1:8000` in clients (the sample client does).
 - **Port 8080 clash**: LabVIEW's `ApplicationWebServer` also listens on 8080 on machines with LabVIEW installed,
   which hides the Label Studio UI. Change the `label-studio` port mapping in `docker-compose.yml` if you need both.
-- **Old driver + micro-sam**: conda-forge picks the newest CUDA torch build (12.9). On drivers older than 570 it
-  fails with "CUDA error: named symbol not found"; rebuild with
+- **Old NVIDIA driver / CUDA mismatch**: each image is built for a CUDA version (gateway 12.6, micro-sam 12.9
+  by default). If the host driver is older than that CUDA version needs, kernels fail with
+  "CUDA error: named symbol not found". Both services check this at start-up: they log a
+  `CUDA MISMATCH` banner, skip loading models, report `"cuda": {"ok": false, "warning": ...}` in `/health`
+  and list the warning in `/ready` (HTTP 503), including the minimum driver version. **Fix on the host:**
+  update the NVIDIA display driver (https://www.nvidia.com/drivers, >= 570 for CUDA 12.8+), restart Docker
+  Desktop, `docker compose up -d`. Alternative: rebuild micro-sam pinned to an older CUDA,
   `docker compose build --build-arg CUDA_PIN='"cuda-version=12.6"' --build-arg CUDA_VERSION=12.6 micro-sam-inference`.
 
 ## 📦 Deployment (pre-built images)

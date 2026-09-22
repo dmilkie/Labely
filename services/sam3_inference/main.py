@@ -25,7 +25,7 @@ import uvicorn
 from segmentation_common import (
     InferenceRequest, InferenceResponse, Point, OUTPUT_TYPES,
     resolve_model, validate_request, normalize_boxes, points_to_arrays,
-    load_image, image_to_data_uri, build_response,
+    load_image, image_to_data_uri, build_response, log_cuda_compat,
 )
 
 logger = logging.getLogger("uvicorn.info")
@@ -43,6 +43,7 @@ MICROSAM_URL = os.getenv("MICROSAM_URL", "http://micro-sam-inference:8001")
 _predictor = None
 _sam3 = None  # (model, processor)
 _sam3_error = None
+_cuda = {"ok": True, "warning": None}  # filled at startup by log_cuda_compat()
 
 
 def _device():
@@ -94,12 +95,17 @@ def get_sam3():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    get_predictor()  # SAM2 always
-    if os.getenv("HF_TOKEN"):
-        try:
-            get_sam3()  # warm up SAM3 if a token is present
-        except HTTPException:
-            pass
+    global _cuda
+    _cuda = log_cuda_compat(logger, "gateway")
+    if _cuda["ok"]:
+        get_predictor()  # SAM2 always
+        if os.getenv("HF_TOKEN"):
+            try:
+                get_sam3()  # warm up SAM3 if a token is present
+            except HTTPException:
+                pass
+    else:
+        logger.error("GPU unusable, models not loaded. /ready stays 503 until the host driver is fixed.")
     yield
 
 
@@ -122,7 +128,8 @@ async def health():
                    ("error: " + _sam3_error) if _sam3_error else
                    ("not loaded yet" if os.getenv("HF_TOKEN") else "disabled (no HF_TOKEN)"))
     return {
-        "status": "healthy",
+        "status": "healthy" if _cuda["ok"] else "degraded",
+        "cuda": _cuda,
         "models": {
             "sam2": f"loaded (SAM2.1-{SAM2_SIZE})" if _predictor is not None else "not loaded",
             "sam3": sam3_status,
@@ -147,6 +154,8 @@ async def ready(response: Response):
     ready unless MICROSAM_URL is empty (micro-sam disabled).
     """
     problems = []
+    if not _cuda["ok"]:
+        problems.append(_cuda["warning"])
     if _predictor is None:
         problems.append("sam2 not loaded")
     if os.getenv("HF_TOKEN") and _sam3 is None:
@@ -155,7 +164,10 @@ async def ready(response: Response):
         try:
             r = requests.get(f"{MICROSAM_URL}/ready", timeout=3)
             if r.status_code != 200:
-                problems.append(f"micro-sam not ready: {r.text[:200]}")
+                try:
+                    problems.extend("micro-sam: " + p for p in r.json().get("problems", [r.text[:200]]))
+                except ValueError:
+                    problems.append(f"micro-sam not ready: {r.text[:200]}")
         except Exception as e:
             problems.append(f"micro-sam unreachable: {type(e).__name__}")
     if problems:

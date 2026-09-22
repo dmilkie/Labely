@@ -105,7 +105,12 @@ if box is not None:
 
 # 3. POST (Content-Type: application/json is set by json=)
 resp = requests.post(URL, json=payload, timeout=120)
-resp.raise_for_status()
+if resp.status_code != 200:
+    try:
+        detail = resp.json().get("detail", resp.text)
+    except ValueError:
+        detail = resp.text
+    sys.exit(f"server returned HTTP {resp.status_code}: {detail}")
 result = resp.json()
 
 # 4. Use the result
