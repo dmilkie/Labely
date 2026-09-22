@@ -272,14 +272,19 @@ def cuda_compat_report() -> dict:
             rep["driver_version"] = out[0].strip()
     except Exception:
         pass
-    fake = os.getenv("LABELY_FAKE_DRIVER_CUDA")
+    fake = os.getenv("LABELY_FAKE_DRIVER_CUDA")  # testing only: pretend the driver is this old and the probe failed
     if fake:
         rep["driver_cuda"] = fake
         rep["faked"] = True
 
-    # functional probe: a real kernel launch + matmul catches "named symbol not found" and friends
+    # functional probe: a real kernel launch + matmul catches "named symbol not found" and friends.
+    # This is the deciding test. A driver older than the image's CUDA version often still works thanks to
+    # CUDA minor-version compatibility (e.g. a 12.6 build on a 12.2 driver), so the version gap alone is
+    # only reported as a note.
     probe_error = None
-    if not fake:
+    if fake:
+        probe_error = "simulated (LABELY_FAKE_DRIVER_CUDA)"
+    else:
         try:
             x = torch.randn(64, 64, device="cuda")
             (x @ x).sum().item()
@@ -289,16 +294,21 @@ def cuda_compat_report() -> dict:
 
     build, drv = _parse_ver(rep["build_cuda"]), _parse_ver(rep["driver_cuda"])
     version_gap = build is not None and drv is not None and drv < build
-    if probe_error or version_gap:
+    need = _MIN_DRIVER.get(build, "the latest") if build else "the latest"
+    drv_txt = f"NVIDIA driver {rep['driver_version'] or '?'} (supports CUDA <= {rep['driver_cuda'] or '?'})"
+    if probe_error:
         rep["ok"] = False
-        need = _MIN_DRIVER.get(build, "the latest") if build else "the latest"
-        drv_txt = (f"NVIDIA driver {rep['driver_version'] or '?'} (supports CUDA <= {rep['driver_cuda'] or '?'})")
         rep["warning"] = (
-            f"CUDA MISMATCH: this image was built for CUDA {rep['build_cuda']} but the host's {drv_txt} is too old"
-            + (f"; GPU probe failed: {probe_error}" if probe_error else "")
-            + f". FIX ON THE HOST MACHINE: update the NVIDIA display driver to version {need} or newer "
-            f"({DRIVER_DOWNLOAD_URL}), then restart Docker Desktop and run `docker compose up -d` again. "
-            f"(Alternative: rebuild this image with a CUDA pin matching the driver, see services/*/Dockerfile.)"
+            f"CUDA MISMATCH: this image was built for CUDA {rep['build_cuda']} but the host's {drv_txt} "
+            f"cannot run it (GPU probe failed: {probe_error}). FIX ON THE HOST MACHINE: update the NVIDIA "
+            f"display driver to version {need} or newer ({DRIVER_DOWNLOAD_URL}), then restart Docker Desktop "
+            f"and run `docker compose up -d` again. (Alternative: rebuild this image with a CUDA pin matching "
+            f"the driver, see services/*/Dockerfile.)"
+        )
+    elif version_gap:
+        rep["note"] = (
+            f"Host {drv_txt} is older than this image's CUDA {rep['build_cuda']}; it works through CUDA "
+            f"minor-version compatibility. Updating the NVIDIA driver to {need}+ is recommended."
         )
     return rep
 
@@ -310,6 +320,8 @@ def log_cuda_compat(logger, service: str) -> dict:
     if rep["ok"]:
         logger.info(f"[{service}] GPU {rep['gpu']}: driver {rep['driver_version']} (CUDA <= {rep['driver_cuda']}), "
                     f"image built for CUDA {rep['build_cuda']} - compatible")
+        if rep.get("note"):
+            logger.warning(f"[{service}] {rep['note']}")
     else:
         bar = "!" * 100
         logger.error(f"\n{bar}\n[{service}] {rep['warning']}\n{bar}")
